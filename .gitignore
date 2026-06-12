@@ -1,0 +1,26 @@
+node_modules/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/*
+!src-tauri/binaries/ffmpeg-aarch64-apple-darwin
+!src-tauri/binaries/ffprobe-aarch64-apple-darwin
+
+.cache/
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# SenseVoice and local test media are managed outside Git.
+models/
+
+# Local task output.
+*.srt
+*.tmp
