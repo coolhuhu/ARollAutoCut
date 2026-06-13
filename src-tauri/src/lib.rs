@@ -11,8 +11,8 @@ use services::exporter::{
     export_edited_media as run_export, ExportProgress, ExportRequest, ExportResult,
 };
 use services::model_manager::{
-    configured_model_directory, inspect_model_directory, save_model_directory, ModelState,
-    ModelStatus,
+    configured_model_directory, default_model_directory, download_model as run_model_download,
+    inspect_model_directory, save_model_directory, ModelDownloadProgress, ModelState, ModelStatus,
 };
 use services::speech::SpeechModelPaths;
 use services::transcription::{
@@ -48,6 +48,41 @@ fn select_model_directory(app: tauri::AppHandle, directory: String) -> Result<Mo
     save_model_directory(&app_config_dir, &directory)
         .map_err(|error| format!("无法保存模型设置：{error}"))?;
     Ok(status)
+}
+
+#[tauri::command]
+async fn download_model(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ProcessingTaskState>,
+) -> Result<ModelStatus, String> {
+    let (app_data_dir, app_config_dir) = app_directories(&app)?;
+    let destination = default_model_directory(&app_data_dir);
+    let cancellation = state.begin().map_err(str::to_owned)?;
+    let task_cancellation = cancellation.clone();
+    let event_app = app.clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let status = run_model_download(
+            &destination,
+            &task_cancellation,
+            |progress: ModelDownloadProgress| {
+                let _ = event_app.emit("model-download-progress", progress);
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        save_model_directory(&app_config_dir, &destination)
+            .map_err(|error| format!("模型已下载，但无法保存模型目录设置：{error}"))?;
+        Ok(status)
+    })
+    .await;
+
+    state.finish(&cancellation);
+    joined.map_err(|error| format!("模型下载任务异常终止：{error}"))?
+}
+
+#[tauri::command]
+fn cancel_model_download(state: tauri::State<'_, ProcessingTaskState>) -> bool {
+    state.cancel()
 }
 
 #[tauri::command]
@@ -190,12 +225,7 @@ fn bundled_binary(app: &tauri::AppHandle, binary: &str) -> Option<PathBuf> {
         .ok()
         .and_then(|path| path.parent().map(Path::to_path_buf));
     let development_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
-    let names = [
-        binary.to_owned(),
-        format!("{binary}-aarch64-apple-darwin"),
-        format!("{binary}.exe"),
-        format!("{binary}-x86_64-pc-windows-msvc.exe"),
-    ];
+    let names = bundled_binary_names(binary, std::env::consts::OS, std::env::consts::ARCH);
 
     let directories = resource_dir
         .into_iter()
@@ -214,6 +244,21 @@ fn bundled_binary(app: &tauri::AppHandle, binary: &str) -> Option<PathBuf> {
     None
 }
 
+fn bundled_binary_names(binary: &str, os: &str, architecture: &str) -> Vec<String> {
+    let generic_name = if os == "windows" {
+        format!("{binary}.exe")
+    } else {
+        binary.to_owned()
+    };
+    let target_name = match (os, architecture) {
+        ("macos", "aarch64") => Some(format!("{binary}-aarch64-apple-darwin")),
+        ("windows", "x86_64") => Some(format!("{binary}-x86_64-pc-windows-msvc.exe")),
+        _ => None,
+    };
+
+    std::iter::once(generic_name).chain(target_name).collect()
+}
+
 fn bundled_ffmpeg(app: &tauri::AppHandle) -> Option<PathBuf> {
     bundled_binary(app, "ffmpeg")
 }
@@ -227,6 +272,8 @@ pub fn run() {
             get_app_info,
             get_model_status,
             select_model_directory,
+            download_model,
+            cancel_model_download,
             transcribe_media,
             cancel_transcription,
             export_edited_media,
@@ -234,4 +281,25 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run ARollCut");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bundled_binary_names;
+
+    #[test]
+    fn resolves_macos_apple_silicon_sidecar_names() {
+        assert_eq!(
+            bundled_binary_names("ffmpeg", "macos", "aarch64"),
+            vec!["ffmpeg", "ffmpeg-aarch64-apple-darwin"]
+        );
+    }
+
+    #[test]
+    fn resolves_windows_x64_sidecar_names() {
+        assert_eq!(
+            bundled_binary_names("ffprobe", "windows", "x86_64"),
+            vec!["ffprobe.exe", "ffprobe-x86_64-pc-windows-msvc.exe"]
+        );
+    }
 }

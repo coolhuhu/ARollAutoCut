@@ -27,7 +27,6 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
     "resources": [
       "resources/silero_vad.onnx",
       "resources/THIRD_PARTY_NOTICES.md",
@@ -43,9 +42,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "macOS": {
-      "minimumSystemVersion": "12.0"
-    }
+    ]
   }
 }

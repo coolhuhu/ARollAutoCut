@@ -13,7 +13,7 @@ impl ProcessingTaskState {
             .lock()
             .expect("recognition task mutex poisoned");
         if current.is_some() {
-            return Err("已有媒体处理任务正在进行");
+            return Err("已有任务正在进行");
         }
 
         let token = Arc::new(AtomicBool::new(false));
@@ -55,13 +55,13 @@ mod tests {
     use super::ProcessingTaskState;
 
     #[test]
-    fn permits_only_one_active_recognition() {
+    fn permits_only_one_active_task() {
         let state = ProcessingTaskState::default();
         let first = state.begin().expect("first task");
 
         assert_eq!(
             state.begin().expect_err("second task should fail"),
-            "已有媒体处理任务正在进行"
+            "已有任务正在进行"
         );
 
         state.finish(&first);

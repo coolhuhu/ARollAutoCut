@@ -2,6 +2,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,10 +161,19 @@ pub fn export_edited_media(
     on_progress(export_progress(92, "正在生成字幕文件"));
     if let Err(error) = fs::write(&temporary_subtitle, render_srt(&timeline.cues)) {
         let _ = fs::remove_file(&temporary_media);
+        let _ = fs::remove_file(&temporary_subtitle);
         return Err(ExportError::Io(error));
     }
-    replace_file(&temporary_media, request.destination)?;
-    replace_file(&temporary_subtitle, &subtitle_path)?;
+    if let Err(error) = replace_export_files(
+        &temporary_media,
+        request.destination,
+        &temporary_subtitle,
+        &subtitle_path,
+    ) {
+        let _ = fs::remove_file(&temporary_media);
+        let _ = fs::remove_file(&temporary_subtitle);
+        return Err(error);
+    }
     on_progress(export_progress(100, "导出完成"));
 
     Ok(ExportResult {
@@ -362,24 +372,44 @@ fn run_ffmpeg(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(ExportError::Io)?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .expect("stderr is piped for FFmpeg diagnostics");
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stderr_reader.join();
             return Err(ExportError::Cancelled);
         }
-        match child.try_wait().map_err(ExportError::Io)? {
-            Some(status) => {
-                let output = child.wait_with_output().map_err(ExportError::Io)?;
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = stderr_reader
+                    .join()
+                    .map_err(|_| {
+                        ExportError::Io(std::io::Error::other("读取 FFmpeg 错误输出的线程异常终止"))
+                    })?
+                    .map_err(ExportError::Io)?;
                 if status.success() {
                     return Ok(());
                 }
                 return Err(ExportError::FfmpegFailed(
-                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    String::from_utf8_lossy(&output).trim().to_owned(),
                 ));
             }
-            None => thread::sleep(Duration::from_millis(50)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stderr_reader.join();
+                return Err(ExportError::Io(error));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
         }
     }
 }
@@ -396,9 +426,67 @@ fn temporary_output_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{stem}.arollcut.tmp.{extension}"))
 }
 
-fn replace_file(temporary: &Path, destination: &Path) -> Result<(), ExportError> {
-    remove_if_exists(destination)?;
-    fs::rename(temporary, destination).map_err(ExportError::Io)
+fn replace_export_files(
+    temporary_media: &Path,
+    destination_media: &Path,
+    temporary_subtitle: &Path,
+    destination_subtitle: &Path,
+) -> Result<(), ExportError> {
+    let media_backup = backup_existing_file(destination_media)?;
+    let subtitle_backup = match backup_existing_file(destination_subtitle) {
+        Ok(backup) => backup,
+        Err(error) => {
+            restore_backup(destination_media, media_backup.as_deref());
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = fs::rename(temporary_media, destination_media) {
+        restore_backup(destination_media, media_backup.as_deref());
+        restore_backup(destination_subtitle, subtitle_backup.as_deref());
+        return Err(ExportError::Io(error));
+    }
+    if let Err(error) = fs::rename(temporary_subtitle, destination_subtitle) {
+        let _ = fs::remove_file(destination_media);
+        restore_backup(destination_media, media_backup.as_deref());
+        restore_backup(destination_subtitle, subtitle_backup.as_deref());
+        return Err(ExportError::Io(error));
+    }
+
+    for backup in [media_backup, subtitle_backup].into_iter().flatten() {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
+fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>, ExportError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let backup = backup_output_path(path);
+    remove_if_exists(&backup)?;
+    fs::rename(path, &backup).map_err(ExportError::Io)?;
+    Ok(Some(backup))
+}
+
+fn restore_backup(destination: &Path, backup: Option<&Path>) {
+    let Some(backup) = backup else {
+        return;
+    };
+    let _ = fs::remove_file(destination);
+    let _ = fs::rename(backup, destination);
+}
+
+fn backup_output_path(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("output");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{stem}.arollcut.backup.{extension}"))
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), ExportError> {
@@ -426,11 +514,14 @@ fn export_progress(percent: u8, message: &str) -> ExportProgress {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
+    use tempfile::tempdir;
+
     use super::{
-        audio_encoder, build_filter_graph, temporary_output_path, validate_container,
-        video_encoder, ExportError,
+        audio_encoder, backup_output_path, build_filter_graph, replace_export_files,
+        temporary_output_path, validate_container, video_encoder, ExportError,
     };
     use crate::domain::export::build_export_timeline;
     use crate::domain::transcript::TranscriptSegment;
@@ -498,6 +589,34 @@ mod tests {
             temporary_output_path(Path::new("/tmp/final cut.mp4")),
             Path::new("/tmp/.final cut.arollcut.tmp.mp4")
         );
+    }
+
+    #[test]
+    fn restores_existing_exports_when_installing_the_subtitle_fails() {
+        let directory = tempdir().expect("temporary directory");
+        let media = directory.path().join("output.wav");
+        let subtitle = directory.path().join("output.srt");
+        let temporary_media = directory.path().join("new.wav");
+        let missing_temporary_subtitle = directory.path().join("missing.srt");
+        fs::write(&media, b"old media").expect("old media");
+        fs::write(&subtitle, b"old subtitle").expect("old subtitle");
+        fs::write(&temporary_media, b"new media").expect("new media");
+
+        replace_export_files(
+            &temporary_media,
+            &media,
+            &missing_temporary_subtitle,
+            &subtitle,
+        )
+        .expect_err("subtitle installation should fail");
+
+        assert_eq!(fs::read(&media).expect("restored media"), b"old media");
+        assert_eq!(
+            fs::read(&subtitle).expect("restored subtitle"),
+            b"old subtitle"
+        );
+        assert!(!backup_output_path(&media).exists());
+        assert!(!backup_output_path(&subtitle).exists());
     }
 
     fn segment(id: u32, start: u64, end: u64) -> TranscriptSegment {

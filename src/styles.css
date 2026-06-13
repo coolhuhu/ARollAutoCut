@@ -335,6 +335,35 @@ h1 {
   font-weight: 650;
 }
 
+.model-download-panel {
+  margin-top: 22px;
+  padding: 16px;
+  border-radius: 12px;
+  background: #f5f8fd;
+}
+
+.download-heading {
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  color: #45536a;
+  font-size: 13px;
+}
+
+.model-download-panel p {
+  margin: 9px 0 14px;
+  color: #7b8596;
+  font-size: 12px;
+}
+
+.model-download-panel button {
+  padding: 9px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
 .secondary-button {
   border: 1px solid #ccd4e0;
   color: #354258;

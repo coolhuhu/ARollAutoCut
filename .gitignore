@@ -11,6 +11,8 @@ src-tauri/gen/
 src-tauri/binaries/*
 !src-tauri/binaries/ffmpeg-aarch64-apple-darwin
 !src-tauri/binaries/ffprobe-aarch64-apple-darwin
+!src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
+!src-tauri/binaries/ffprobe-x86_64-pc-windows-msvc.exe
 
 .cache/
 .DS_Store

@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bzip2::read::BzDecoder;
 use serde::{Deserialize, Serialize};
@@ -125,7 +126,7 @@ pub fn save_model_directory(app_config_dir: &Path, directory: &Path) -> io::Resu
 }
 
 pub fn inspect_model_directory(directory: &Path) -> io::Result<ModelStatus> {
-    inspect_with_manifest(directory, &MODEL_FILES)
+    inspect_with_manifest(directory, &MODEL_FILES, None)
 }
 
 pub fn download_model(
@@ -153,7 +154,7 @@ pub fn download_model(
             "正在解压 INT8 模型文件",
         ));
         fs::create_dir_all(&staging_path).map_err(ModelDownloadError::Io)?;
-        extract_required_files(&archive_path, &staging_path)?;
+        extract_required_files(&archive_path, &staging_path, cancelled)?;
 
         check_download_cancelled(cancelled)?;
         on_progress(download_progress(
@@ -163,7 +164,8 @@ pub fn download_model(
             97,
             "正在校验文件大小和 SHA-256",
         ));
-        let status = inspect_model_directory(&staging_path).map_err(ModelDownloadError::Io)?;
+        let status = inspect_with_manifest(&staging_path, &MODEL_FILES, Some(cancelled))
+            .map_err(map_download_io_error)?;
         if status.state != ModelState::Ready {
             return Err(ModelDownloadError::Validation(status.issues));
         }
@@ -192,7 +194,17 @@ fn download_archive(
     cancelled: &AtomicBool,
     on_progress: &mut dyn FnMut(ModelDownloadProgress),
 ) -> Result<(), ModelDownloadError> {
-    if !MODEL_DOWNLOAD_URL.ends_with(MODEL_ARCHIVE_NAME) {
+    check_download_cancelled(cancelled)?;
+    download_archive_from_url(MODEL_DOWNLOAD_URL, archive_path, cancelled, on_progress)
+}
+
+fn download_archive_from_url(
+    url: &str,
+    archive_path: &Path,
+    cancelled: &AtomicBool,
+    on_progress: &mut dyn FnMut(ModelDownloadProgress),
+) -> Result<(), ModelDownloadError> {
+    if url == MODEL_DOWNLOAD_URL && !url.ends_with(MODEL_ARCHIVE_NAME) {
         return Err(ModelDownloadError::InvalidArchive(
             "官方下载地址中的文件名不匹配".to_owned(),
         ));
@@ -207,25 +219,47 @@ fn download_archive(
     ));
     let client = reqwest::blocking::Client::builder()
         .user_agent("ARollCut/0.1")
+        .connect_timeout(Duration::from_secs(15))
         .build()
         .map_err(ModelDownloadError::Request)?;
     let mut response = client
-        .get(MODEL_DOWNLOAD_URL)
+        .get(url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(ModelDownloadError::Request)?;
     let total_bytes = response.content_length();
     let mut archive = File::create(archive_path).map_err(ModelDownloadError::Io)?;
+
+    copy_download_stream(
+        &mut response,
+        &mut archive,
+        total_bytes,
+        cancelled,
+        on_progress,
+    )
+}
+
+fn copy_download_stream(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    total_bytes: Option<u64>,
+    cancelled: &AtomicBool,
+    on_progress: &mut dyn FnMut(ModelDownloadProgress),
+) -> Result<(), ModelDownloadError> {
     let mut downloaded_bytes = 0_u64;
     let mut buffer = [0_u8; 128 * 1024];
 
     loop {
         check_download_cancelled(cancelled)?;
-        let read = response.read(&mut buffer).map_err(ModelDownloadError::Io)?;
+        let read = match reader.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => continue,
+            Err(error) => return Err(ModelDownloadError::Io(error)),
+        };
         if read == 0 {
             break;
         }
-        archive
+        writer
             .write_all(&buffer[..read])
             .map_err(ModelDownloadError::Io)?;
         downloaded_bytes += read as u64;
@@ -241,7 +275,7 @@ fn download_archive(
             "正在下载 SenseVoice 模型",
         ));
     }
-    archive.flush().map_err(ModelDownloadError::Io)?;
+    writer.flush().map_err(ModelDownloadError::Io)?;
 
     if let Some(expected) = total_bytes {
         if downloaded_bytes != expected {
@@ -256,6 +290,7 @@ fn download_archive(
 fn extract_required_files(
     archive_path: &Path,
     destination: &Path,
+    cancelled: &AtomicBool,
 ) -> Result<(), ModelDownloadError> {
     let archive_file = File::open(archive_path).map_err(ModelDownloadError::Io)?;
     let decoder = BzDecoder::new(archive_file);
@@ -263,6 +298,7 @@ fn extract_required_files(
     let mut extracted = Vec::new();
 
     for entry in archive.entries().map_err(ModelDownloadError::Io)? {
+        check_download_cancelled(cancelled)?;
         let mut entry = entry.map_err(ModelDownloadError::Io)?;
         if !entry.header().entry_type().is_file() {
             continue;
@@ -280,7 +316,9 @@ fn extract_required_files(
         }
 
         let output = destination.join(&file_name);
-        entry.unpack(&output).map_err(ModelDownloadError::Io)?;
+        let mut output_file = File::create(&output).map_err(ModelDownloadError::Io)?;
+        copy_with_cancellation(&mut entry, &mut output_file, cancelled)?;
+        output_file.flush().map_err(ModelDownloadError::Io)?;
         extracted.push(file_name);
     }
 
@@ -295,11 +333,37 @@ fn extract_required_files(
     Ok(())
 }
 
+fn copy_with_cancellation(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    cancelled: &AtomicBool,
+) -> Result<(), ModelDownloadError> {
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        check_download_cancelled(cancelled)?;
+        let read = reader.read(&mut buffer).map_err(ModelDownloadError::Io)?;
+        if read == 0 {
+            return Ok(());
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(ModelDownloadError::Io)?;
+    }
+}
+
 fn check_download_cancelled(cancelled: &AtomicBool) -> Result<(), ModelDownloadError> {
     if cancelled.load(Ordering::Relaxed) {
         Err(ModelDownloadError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+fn map_download_io_error(error: io::Error) -> ModelDownloadError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        ModelDownloadError::Cancelled
+    } else {
+        ModelDownloadError::Io(error)
     }
 }
 
@@ -339,7 +403,11 @@ fn settings_path(app_config_dir: &Path) -> PathBuf {
     app_config_dir.join("settings.json")
 }
 
-fn inspect_with_manifest(directory: &Path, manifest: &[ModelFileSpec]) -> io::Result<ModelStatus> {
+fn inspect_with_manifest(
+    directory: &Path,
+    manifest: &[ModelFileSpec],
+    cancelled: Option<&AtomicBool>,
+) -> io::Result<ModelStatus> {
     let mut missing = Vec::new();
     let mut invalid = Vec::new();
 
@@ -359,7 +427,7 @@ fn inspect_with_manifest(directory: &Path, manifest: &[ModelFileSpec]) -> io::Re
             continue;
         }
 
-        let actual_hash = sha256_file(&path)?;
+        let actual_hash = sha256_file(&path, cancelled)?;
         if actual_hash != spec.sha256 {
             invalid.push(format!("{} 的 SHA-256 校验失败", spec.name));
         }
@@ -381,12 +449,15 @@ fn inspect_with_manifest(directory: &Path, manifest: &[ModelFileSpec]) -> io::Re
     })
 }
 
-fn sha256_file(path: &Path) -> io::Result<String> {
+fn sha256_file(path: &Path, cancelled: Option<&AtomicBool>) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
 
     loop {
+        if cancelled.is_some_and(|token| token.load(Ordering::Relaxed)) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "模型校验已取消"));
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -400,6 +471,7 @@ fn sha256_file(path: &Path) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
+    use std::io::Cursor;
 
     use bzip2::write::BzEncoder;
     use bzip2::Compression;
@@ -407,9 +479,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        configured_model_directory, default_model_directory, extract_required_files,
-        inspect_with_manifest, save_model_directory, ModelFileSpec, ModelState, MODEL_ARCHIVE_NAME,
-        MODEL_DIRECTORY_NAME, MODEL_DOWNLOAD_URL,
+        configured_model_directory, copy_download_stream, default_model_directory, download_model,
+        extract_required_files, inspect_with_manifest, map_download_io_error, save_model_directory,
+        ModelDownloadError, ModelFileSpec, ModelState, MODEL_ARCHIVE_NAME, MODEL_DIRECTORY_NAME,
+        MODEL_DOWNLOAD_URL,
     };
 
     #[test]
@@ -429,7 +502,7 @@ mod tests {
         let directory = tempdir().expect("temp directory");
         let manifest = [spec("model.onnx", b"model")];
 
-        let status = inspect_with_manifest(directory.path(), &manifest).expect("status");
+        let status = inspect_with_manifest(directory.path(), &manifest, None).expect("status");
 
         assert_eq!(status.state, ModelState::Missing);
         assert_eq!(status.issues, vec!["缺少文件：model.onnx"]);
@@ -441,7 +514,7 @@ mod tests {
         fs::write(directory.path().join("model.onnx"), b"bad").expect("write model");
         let manifest = [spec("model.onnx", b"expected")];
 
-        let status = inspect_with_manifest(directory.path(), &manifest).expect("status");
+        let status = inspect_with_manifest(directory.path(), &manifest, None).expect("status");
 
         assert_eq!(status.state, ModelState::Invalid);
         assert!(status.issues[0].contains("大小不正确"));
@@ -454,7 +527,7 @@ mod tests {
         fs::write(directory.path().join("tokens.txt"), b"tokens").expect("write tokens");
         let manifest = [spec("model.onnx", b"model"), spec("tokens.txt", b"tokens")];
 
-        let status = inspect_with_manifest(directory.path(), &manifest).expect("status");
+        let status = inspect_with_manifest(directory.path(), &manifest, None).expect("status");
 
         assert_eq!(status.state, ModelState::Ready);
         assert!(status.issues.is_empty());
@@ -509,7 +582,8 @@ mod tests {
             ],
         );
 
-        extract_required_files(&archive_path, &destination).expect("extract model");
+        extract_required_files(&archive_path, &destination, &AtomicBool::new(false))
+            .expect("extract model");
 
         assert_eq!(
             fs::read(destination.join("model.int8.onnx")).expect("int8 model"),
@@ -531,10 +605,61 @@ mod tests {
         fs::create_dir_all(&destination).expect("destination");
         write_test_archive(&archive_path, &[("release/model.int8.onnx", b"int8 model")]);
 
-        let error =
-            extract_required_files(&archive_path, &destination).expect_err("missing tokens");
+        let error = extract_required_files(&archive_path, &destination, &AtomicBool::new(false))
+            .expect_err("missing tokens");
 
         assert!(error.to_string().contains("tokens.txt"));
+    }
+
+    #[test]
+    fn copies_a_download_stream_with_byte_progress() {
+        let contents = b"test archive bytes".to_vec();
+        let mut source = Cursor::new(contents.clone());
+        let mut destination = Vec::new();
+        let mut updates = Vec::new();
+
+        copy_download_stream(
+            &mut source,
+            &mut destination,
+            Some(contents.len() as u64),
+            &AtomicBool::new(false),
+            &mut |progress| updates.push(progress),
+        )
+        .expect("copy download stream");
+
+        assert_eq!(destination, contents);
+        let final_update = updates.last().expect("progress update");
+        assert_eq!(final_update.downloaded_bytes, contents.len() as u64);
+        assert_eq!(final_update.total_bytes, Some(contents.len() as u64));
+    }
+
+    #[test]
+    fn cancels_before_starting_a_network_request() {
+        let directory = tempdir().expect("temp directory");
+        let cancelled = AtomicBool::new(true);
+
+        let error = download_model(directory.path(), &cancelled, |_| {})
+            .expect_err("download should be cancelled");
+
+        assert!(matches!(error, ModelDownloadError::Cancelled));
+        assert!(!directory
+            .path()
+            .join(format!(".{MODEL_ARCHIVE_NAME}.download"))
+            .exists());
+    }
+
+    #[test]
+    fn maps_cancelled_hash_validation_to_a_cancelled_download() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(directory.path().join("model.onnx"), b"model").expect("write model");
+        let manifest = [spec("model.onnx", b"model")];
+        let cancelled = AtomicBool::new(true);
+
+        let error = inspect_with_manifest(directory.path(), &manifest, Some(&cancelled))
+            .map_err(map_download_io_error)
+            .expect_err("validation should be cancelled");
+
+        assert!(matches!(error, ModelDownloadError::Cancelled));
     }
 
     fn spec(name: &'static str, contents: &[u8]) -> ModelFileSpec {
@@ -565,4 +690,5 @@ mod tests {
     }
 
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
 }

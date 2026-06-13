@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { APP_NAME, supportedFormatsLabel } from "./app-info";
 import {
@@ -8,7 +8,9 @@ import {
   chooseMediaFile,
   exportEditedMedia,
   formatMediaTimestamp,
+  listenForAppClose,
   listenForMediaDrop,
+  shouldProtectAppClose,
   transcribeMedia,
   type ExportProgress,
   type ExportResult,
@@ -17,8 +19,12 @@ import {
   type TranscriptionResult,
 } from "./media-api";
 import {
+  cancelModelDownload,
   chooseModelDirectory,
+  downloadModel,
+  formatDownloadBytes,
   getModelStatus,
+  type ModelDownloadProgress,
   type ModelStatus,
 } from "./model-api";
 
@@ -79,6 +85,16 @@ export default function App() {
     null,
   );
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [modelDownloadProgress, setModelDownloadProgress] =
+    useState<ModelDownloadProgress | null>(null);
+  const closeProtectionRef = useRef(false);
+  closeProtectionRef.current = shouldProtectAppClose({
+    isDownloadingModel: modelDownloadProgress !== null,
+    isProcessing: phase === "processing",
+    isExporting: exportProgress !== null,
+    isEditing: phase === "editor",
+    exportCompleted: exportResult !== null,
+  });
 
   useEffect(() => {
     void refreshModelStatus();
@@ -106,6 +122,29 @@ export default function App() {
     };
   }, [modelStatus?.state, phase]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listenForAppClose(() => closeProtectionRef.current).then(
+      (stopListening) => {
+        if (disposed) {
+          stopListening();
+        } else {
+          unlisten = stopListening;
+        }
+      },
+    );
+
+    return () => {
+      if (disposed) {
+        return;
+      }
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
   async function refreshModelStatus() {
     try {
       setModelError("");
@@ -125,6 +164,34 @@ export default function App() {
     } catch (error) {
       setModelError(String(error));
     }
+  }
+
+  async function startModelDownload() {
+    try {
+      setModelError("");
+      setModelDownloadProgress({
+        stage: "downloading",
+        downloadedBytes: 0,
+        totalBytes: null,
+        percent: 0,
+        message: "正在准备下载 SenseVoice 模型",
+      });
+      setModelStatus(await downloadModel(setModelDownloadProgress));
+    } catch (error) {
+      const message = String(error);
+      if (!message.includes("已取消")) {
+        setModelError(message);
+      }
+    } finally {
+      setModelDownloadProgress(null);
+    }
+  }
+
+  async function stopModelDownload() {
+    setModelDownloadProgress((current) =>
+      current ? { ...current, message: "正在取消模型下载" } : current,
+    );
+    await cancelModelDownload();
   }
 
   async function selectMedia() {
@@ -580,6 +647,7 @@ export default function App() {
                 className="icon-button"
                 type="button"
                 aria-label="关闭模型设置"
+                disabled={modelDownloadProgress !== null}
                 onClick={() => setShowModelSettings(false)}
               >
                 ×
@@ -610,18 +678,58 @@ export default function App() {
             )}
             {modelError && <p className="dialog-error">{modelError}</p>}
 
-            <div className="dialog-actions">
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => void selectModelDirectory()}
-              >
-                选择已有模型目录
-              </button>
-              <button className="primary-button" type="button" disabled>
-                下载模型（待接入）
-              </button>
-            </div>
+            {modelDownloadProgress ? (
+              <div className="model-download-panel" aria-live="polite">
+                <div className="download-heading">
+                  <strong>{modelDownloadProgress.message}</strong>
+                  <span>{modelDownloadProgress.percent}%</span>
+                </div>
+                <div
+                  className="progress-track"
+                  role="progressbar"
+                  aria-label="模型下载进度"
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={modelDownloadProgress.percent}
+                >
+                  <span
+                    style={{ width: `${modelDownloadProgress.percent}%` }}
+                  />
+                </div>
+                {modelDownloadProgress.stage === "downloading" && (
+                  <p>
+                    {formatDownloadBytes(
+                      modelDownloadProgress.downloadedBytes,
+                      modelDownloadProgress.totalBytes,
+                    )}
+                  </p>
+                )}
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void stopModelDownload()}
+                >
+                  取消下载
+                </button>
+              </div>
+            ) : (
+              <div className="dialog-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void selectModelDirectory()}
+                >
+                  选择已有模型目录
+                </button>
+                <button
+                  className="primary-button"
+                  type="button"
+                  onClick={() => void startModelDownload()}
+                >
+                  {modelError ? "重试下载模型" : "下载模型"}
+                </button>
+              </div>
+            )}
           </section>
         </div>
       )}

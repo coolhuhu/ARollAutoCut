@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { defaultExportName, formatMediaTimestamp } from "./media-api";
+import {
+  defaultExportName,
+  formatMediaTimestamp,
+  handleAppCloseRequest,
+  shouldProtectAppClose,
+} from "./media-api";
 
 describe("formatMediaTimestamp", () => {
   it("formats sample positions as SRT timestamps", () => {
@@ -22,5 +27,91 @@ describe("defaultExportName", () => {
 
   it("supports files without an extension", () => {
     expect(defaultExportName("/tmp/recording")).toBe("recording-cut");
+  });
+});
+
+describe("shouldProtectAppClose", () => {
+  it("protects active model, recognition, export, and editing work", () => {
+    const idle = {
+      isDownloadingModel: false,
+      isProcessing: false,
+      isExporting: false,
+      isEditing: false,
+      exportCompleted: false,
+    };
+
+    expect(
+      shouldProtectAppClose({ ...idle, isDownloadingModel: true }),
+    ).toBe(true);
+    expect(shouldProtectAppClose({ ...idle, isProcessing: true })).toBe(true);
+    expect(shouldProtectAppClose({ ...idle, isExporting: true })).toBe(true);
+    expect(shouldProtectAppClose({ ...idle, isEditing: true })).toBe(true);
+  });
+
+  it("does not protect an idle or completed session", () => {
+    expect(
+      shouldProtectAppClose({
+        isDownloadingModel: false,
+        isProcessing: false,
+        isExporting: false,
+        isEditing: false,
+        exportCompleted: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldProtectAppClose({
+        isDownloadingModel: false,
+        isProcessing: false,
+        isExporting: false,
+        isEditing: true,
+        exportCompleted: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("handleAppCloseRequest", () => {
+  it("uses a native confirmation and destroys the window when confirmed", async () => {
+    const event = { preventDefault: vi.fn() };
+    const confirmClose = vi.fn().mockResolvedValue(true);
+    const destroyWindow = vi.fn().mockResolvedValue(undefined);
+
+    await handleAppCloseRequest(
+      event,
+      false,
+      confirmClose,
+      destroyWindow,
+    );
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(confirmClose).toHaveBeenCalledWith(
+      "是否关闭 ARollCut？",
+      expect.objectContaining({
+        title: "关闭 ARollCut",
+        okLabel: "关闭",
+        cancelLabel: "取消",
+      }),
+    );
+    expect(destroyWindow).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the window open when closing unfinished work is cancelled", async () => {
+    const event = { preventDefault: vi.fn() };
+    const confirmClose = vi.fn().mockResolvedValue(false);
+    const destroyWindow = vi.fn().mockResolvedValue(undefined);
+
+    await handleAppCloseRequest(
+      event,
+      true,
+      confirmClose,
+      destroyWindow,
+    );
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(confirmClose).toHaveBeenCalledWith(
+      "当前操作尚未完成，关闭 App 将放弃本次编辑。是否继续？",
+      expect.any(Object),
+    );
+    expect(destroyWindow).not.toHaveBeenCalled();
   });
 });

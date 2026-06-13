@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import {
+  confirm,
+  open,
+  save,
+  type ConfirmDialogOptions,
+} from "@tauri-apps/plugin-dialog";
 
 export interface TranscriptSegment {
   id: number;
@@ -146,6 +151,86 @@ export async function listenForMediaDrop(
       onDrop(event.payload.paths[0]);
     }
   });
+}
+
+export async function listenForAppClose(
+  hasUnfinishedWork: () => boolean,
+): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) {
+    return () => {};
+  }
+
+  const appWindow = getCurrentWindow();
+  let confirmationOpen = false;
+  return appWindow.onCloseRequested(async (event) => {
+    if (confirmationOpen) {
+      event.preventDefault();
+      return;
+    }
+
+    confirmationOpen = true;
+    try {
+      await handleAppCloseRequest(
+        event,
+        hasUnfinishedWork(),
+        confirm,
+        () => appWindow.destroy(),
+      );
+    } finally {
+      confirmationOpen = false;
+    }
+  });
+}
+
+type CloseRequestEvent = {
+  preventDefault: () => void;
+};
+
+type ConfirmClose = (
+  message: string,
+  options: ConfirmDialogOptions,
+) => Promise<boolean>;
+
+export async function handleAppCloseRequest(
+  event: CloseRequestEvent,
+  hasUnfinishedWork: boolean,
+  confirmClose: ConfirmClose,
+  destroyWindow: () => Promise<void>,
+): Promise<void> {
+  event.preventDefault();
+  const message = hasUnfinishedWork
+    ? "当前操作尚未完成，关闭 App 将放弃本次编辑。是否继续？"
+    : "是否关闭 ARollCut？";
+  const confirmed = await confirmClose(message, {
+    title: "关闭 ARollCut",
+    kind: "warning",
+    okLabel: "关闭",
+    cancelLabel: "取消",
+  });
+  if (confirmed) {
+    await destroyWindow();
+  }
+}
+
+export function shouldProtectAppClose({
+  isDownloadingModel,
+  isProcessing,
+  isExporting,
+  isEditing,
+  exportCompleted,
+}: {
+  isDownloadingModel: boolean;
+  isProcessing: boolean;
+  isExporting: boolean;
+  isEditing: boolean;
+  exportCompleted: boolean;
+}): boolean {
+  return (
+    isDownloadingModel ||
+    isProcessing ||
+    isExporting ||
+    (isEditing && !exportCompleted)
+  );
 }
 
 export function formatMediaTimestamp(

@@ -8,11 +8,17 @@ import {
   exportEditedMedia,
   transcribeMedia,
 } from "./media-api";
-import { getModelStatus } from "./model-api";
+import { downloadModel, getModelStatus } from "./model-api";
 
 vi.mock("./model-api", () => ({
   getModelStatus: vi.fn(),
   chooseModelDirectory: vi.fn(),
+  downloadModel: vi.fn(),
+  cancelModelDownload: vi.fn(),
+  formatDownloadBytes: (downloadedBytes: number, totalBytes: number | null) =>
+    totalBytes === null
+      ? `${downloadedBytes} B`
+      : `${downloadedBytes} B / ${totalBytes} B`,
 }));
 
 vi.mock("./media-api", async (importOriginal) => {
@@ -26,6 +32,7 @@ vi.mock("./media-api", async (importOriginal) => {
     exportEditedMedia: vi.fn(),
     cancelExport: vi.fn(),
     listenForMediaDrop: vi.fn().mockResolvedValue(() => {}),
+    listenForAppClose: vi.fn().mockResolvedValue(() => {}),
   };
 });
 
@@ -82,6 +89,35 @@ describe("App", () => {
         screen.getByRole("button", { name: /点击上传或拖拽文件到此处/ }),
       ).toBeEnabled(),
     );
+  });
+
+  it("downloads the model and enables media upload", async () => {
+    vi.mocked(downloadModel).mockImplementation(async (onProgress) => {
+      onProgress({
+        stage: "downloading",
+        downloadedBytes: 50,
+        totalBytes: 100,
+        percent: 45,
+        message: "正在下载 SenseVoice 模型",
+      });
+      return {
+        state: "ready",
+        directory: "/App Data/models/sense-voice",
+        issues: [],
+      };
+    });
+
+    render(<App />);
+    await screen.findByText("SenseVoice 模型尚未配置");
+    fireEvent.click(screen.getByRole("button", { name: "模型设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "下载模型" }));
+
+    expect(
+      await screen.findByText("SenseVoice 模型可用"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /点击上传或拖拽文件到此处/ }),
+    ).toBeEnabled();
   });
 
   it("edits recognized subtitles and exports the current state", async () => {
