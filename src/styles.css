@@ -668,8 +668,7 @@ h1 {
   gap: 8px;
 }
 
-.segment-actions button,
-.edit-row button {
+.segment-actions button {
   padding: 8px 11px;
   border: 1px solid #d3dae5;
   border-radius: 8px;
@@ -686,18 +685,24 @@ h1 {
 
 .edit-row {
   margin-top: 9px;
-  display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 8px;
 }
 
-.edit-row input {
+.segment-text-input {
+  width: 100%;
   min-width: 0;
+  min-height: calc(1.55em + 20px);
   padding: 9px 11px;
+  overflow: hidden;
   border: 1px solid #94b8ff;
   border-radius: 8px;
+  box-sizing: border-box;
   color: #202733;
   background: #fff;
+  font-family: inherit;
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1.55;
+  resize: none;
 }
 
 @media (max-width: 820px) {

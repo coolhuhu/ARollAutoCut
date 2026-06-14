@@ -260,6 +260,16 @@ export default function App() {
     setEditingText("");
   }
 
+  function cancelEditing() {
+    setEditingId(null);
+    setEditingText("");
+  }
+
+  function resizeEditingArea(element: HTMLTextAreaElement) {
+    element.style.height = "auto";
+    element.style.height = `${element.scrollHeight}px`;
+  }
+
   function setRetained(id: number, retained: boolean) {
     setSegments((current) =>
       current.map((segment) =>
@@ -388,10 +398,7 @@ export default function App() {
             <div>
               <p className="eyebrow">字幕编辑</p>
               <h1 id="editor-title">保留需要的口播内容</h1>
-              <p>
-                修正识别文字，或删除不需要的字幕片段。导出时将严格使用
-                VAD 时间边界。
-              </p>
+              <p>修正识别文字，或删除不需要的字幕片段。</p>
             </div>
             <div className="segment-summary">
               已保留 <strong>{retainedCount}</strong> / {segments.length} 段
@@ -431,22 +438,35 @@ export default function App() {
                     </div>
                     {isEditing ? (
                       <div className="edit-row">
-                        <input
+                        <textarea
+                          className="segment-text-input"
                           aria-label={`编辑第 ${segment.id} 条字幕`}
-                          value={editingText}
-                          onChange={(event) =>
-                            setEditingText(event.currentTarget.value)
-                          }
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") {
-                              saveEditing();
+                          rows={1}
+                          ref={(element) => {
+                            if (element) {
+                              resizeEditingArea(element);
                             }
+                          }}
+                          value={editingText}
+                          onChange={(event) => {
+                            setEditingText(event.currentTarget.value);
+                            resizeEditingArea(event.currentTarget);
+                          }}
+                          onKeyDown={(event) => {
                             if (event.key === "Escape") {
-                              setEditingId(null);
+                              cancelEditing();
                             }
                           }}
                           autoFocus
                         />
+                      </div>
+                    ) : (
+                      <p>{segment.editedText}</p>
+                    )}
+                  </div>
+                  <div className="segment-actions">
+                    {isEditing ? (
+                      <>
                         <button
                           type="button"
                           onClick={saveEditing}
@@ -454,19 +474,11 @@ export default function App() {
                         >
                           保存
                         </button>
-                        <button
-                          type="button"
-                          onClick={() => setEditingId(null)}
-                        >
+                        <button type="button" onClick={cancelEditing}>
                           取消
                         </button>
-                      </div>
-                    ) : (
-                      <p>{segment.editedText}</p>
-                    )}
-                  </div>
-                  <div className="segment-actions">
-                    {segment.retained ? (
+                      </>
+                    ) : segment.retained ? (
                       <>
                         <button
                           type="button"

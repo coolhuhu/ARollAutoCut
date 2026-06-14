@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
@@ -170,6 +176,12 @@ describe("App", () => {
     expect(
       await screen.findByRole("heading", { name: "保留需要的口播内容" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText("修正识别文字，或删除不需要的字幕片段。"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/导出时将严格使用 VAD 时间边界/),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("00:00:01,500 → 00:00:02,500")).toBeInTheDocument();
 
     fireEvent.click(screen.getAllByRole("button", { name: "删除" })[0]);
@@ -178,12 +190,63 @@ describe("App", () => {
     expect(screen.getByText(/已保留/)).toHaveTextContent("2 / 2 段");
 
     fireEvent.click(screen.getAllByRole("button", { name: "修正" })[0]);
-    fireEvent.change(screen.getByLabelText("编辑第 1 条字幕"), {
-      target: { value: "修正后的第一句" },
+    const editingInput = screen.getByRole("textbox", {
+      name: "编辑第 1 条字幕",
     });
-    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    const editingCard = editingInput.closest("article");
+    expect(editingCard).not.toBeNull();
+    expect(editingInput.tagName).toBe("TEXTAREA");
+    expect(editingInput).toHaveClass("segment-text-input");
+    expect(
+      within(editingCard!).queryByRole("button", { name: "修正" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(editingCard!).queryByRole("button", { name: "删除" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(editingCard!).getByRole("button", { name: "保存" }),
+    ).toBeInTheDocument();
+    expect(
+      within(editingCard!).getByRole("button", { name: "取消" }),
+    ).toBeInTheDocument();
 
-    expect(screen.getByText("修正后的第一句")).toBeInTheDocument();
+    fireEvent.change(editingInput, {
+      target: { value: "不会保存的草稿" },
+    });
+    fireEvent.click(
+      within(editingCard!).getByRole("button", { name: "取消" }),
+    );
+    expect(screen.getByText("第一句")).toBeInTheDocument();
+    expect(
+      within(editingCard!).getByRole("button", { name: "修正" }),
+    ).toBeInTheDocument();
+    expect(
+      within(editingCard!).getByRole("button", { name: "删除" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(editingCard!).getByRole("button", { name: "修正" }),
+    );
+    const multilineInput = screen.getByRole("textbox", {
+      name: "编辑第 1 条字幕",
+    });
+    Object.defineProperty(multilineInput, "scrollHeight", {
+      configurable: true,
+      value: 96,
+    });
+    fireEvent.change(multilineInput, {
+      target: { value: "修正后的第一句\n补充的第二行" },
+    });
+    expect(multilineInput).toHaveStyle({ height: "96px" });
+    fireEvent.click(
+      within(editingCard!).getByRole("button", { name: "保存" }),
+    );
+
+    expect(
+      screen.getByText("修正后的第一句 补充的第二行"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "修正" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "删除" })).toHaveLength(2);
 
     vi.mocked(chooseExportDestination).mockResolvedValue(
       "/tmp/vad-test-cut.wav",
@@ -209,7 +272,7 @@ describe("App", () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: 1,
-          editedText: "修正后的第一句",
+          editedText: "修正后的第一句\n补充的第二行",
           retained: true,
         }),
       ]),
