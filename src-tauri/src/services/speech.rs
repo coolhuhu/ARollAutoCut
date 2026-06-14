@@ -7,6 +7,7 @@ use sherpa_onnx::{
     VadModelConfig, VoiceActivityDetector, Wave,
 };
 
+use crate::domain::subtitle_split::split_recognition;
 use crate::domain::transcript::TranscriptSegment;
 
 const SAMPLE_RATE: i32 = 16_000;
@@ -139,9 +140,10 @@ impl SpeechEngine {
         }
         let detected = detect_speech(samples, &self.paths.vad_model)?;
         let total = detected.len();
-        let mut segments = Vec::with_capacity(total);
+        let mut segments = Vec::new();
+        let mut next_segment_id = 1;
 
-        for (index, speech) in detected.into_iter().enumerate() {
+        for (vad_index, speech) in detected.into_iter().enumerate() {
             if is_cancelled() {
                 return Err(SpeechError::Cancelled);
             }
@@ -152,14 +154,25 @@ impl SpeechEngine {
                 .get_result()
                 .ok_or(SpeechError::MissingRecognitionResult)?;
             let end_sample = speech.start_sample + speech.samples.len() as u64;
-            segments.push(TranscriptSegment::new(
-                index as u32 + 1,
+            let subtitles = split_recognition(
                 speech.start_sample,
                 end_sample,
                 SAMPLE_RATE as u32,
-                result.text.trim().to_owned(),
-            ));
-            on_segment(index + 1, total);
+                &result.text,
+                &result.tokens,
+                result.timestamps.as_deref(),
+            );
+            for subtitle in subtitles {
+                segments.push(TranscriptSegment::new(
+                    next_segment_id,
+                    subtitle.start_sample,
+                    subtitle.end_sample,
+                    SAMPLE_RATE as u32,
+                    subtitle.text,
+                ));
+                next_segment_id += 1;
+            }
+            on_segment(vad_index + 1, total);
         }
 
         Ok(segments)

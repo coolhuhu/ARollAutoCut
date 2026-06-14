@@ -249,6 +249,65 @@ mod tests {
     }
 
     #[test]
+    fn keeps_split_subtitles_in_one_range_when_all_are_retained() {
+        let segments = vec![
+            segment(1, 100, 200, "第一段"),
+            segment(2, 200, 300, "第二段"),
+            segment(3, 300, 400, "第三段"),
+        ];
+
+        let timeline = build_export_timeline(&segments).expect("timeline");
+
+        assert_eq!(
+            timeline.ranges,
+            vec![SampleRange {
+                start_sample: 100,
+                end_sample: 400,
+            }]
+        );
+        assert_eq!(
+            timeline
+                .cues
+                .iter()
+                .map(|cue| (cue.start_sample, cue.end_sample))
+                .collect::<Vec<_>>(),
+            vec![(0, 100), (100, 200), (200, 300)]
+        );
+    }
+
+    #[test]
+    fn removes_only_the_deleted_split_subtitle_range() {
+        let first = segment(1, 100, 200, "第一段");
+        let mut deleted = segment(2, 200, 300, "删除");
+        deleted.delete();
+        let third = segment(3, 300, 400, "第三段");
+
+        let timeline = build_export_timeline(&[first, deleted, third]).expect("timeline");
+
+        assert_eq!(
+            timeline.ranges,
+            vec![
+                SampleRange {
+                    start_sample: 100,
+                    end_sample: 200,
+                },
+                SampleRange {
+                    start_sample: 300,
+                    end_sample: 400,
+                }
+            ]
+        );
+        assert_eq!(
+            timeline
+                .cues
+                .iter()
+                .map(|cue| (cue.start_sample, cue.end_sample))
+                .collect::<Vec<_>>(),
+            vec![(0, 100), (100, 200)]
+        );
+    }
+
+    #[test]
     fn rejects_an_export_with_no_retained_segments() {
         let mut segment = segment(1, 0, 100, "删除");
         segment.delete();
