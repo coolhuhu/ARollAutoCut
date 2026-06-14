@@ -108,6 +108,13 @@ fn preserves_primary_video_properties_when_exporting_a_mov() {
         primary_stream_properties(&source_probe, "audio"),
         primary_stream_properties(&output_probe, "audio")
     );
+    let source_size = source.metadata().expect("source metadata").len();
+    let output_size = output.metadata().expect("output metadata").len();
+    assert!(
+        output_size <= source_size * 11 / 10,
+        "output should not grow by more than 10% when half the source is retained: \
+         source={source_size}, output={output_size}"
+    );
     assert_eq!(
         fs::read_to_string(output.with_extension("srt")).expect("subtitle"),
         "1\n00:00:00,000 --> 00:00:00,750\n保留第一段\n\n\
@@ -120,7 +127,7 @@ fn probe_streams(ffprobe: &PathBuf, media: &std::path::Path) -> serde_json::Valu
         .args(["-v", "error"])
         .args([
             "-show_entries",
-            "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate",
+            "stream=codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate,sample_rate",
         ])
         .args(["-of", "json"])
         .arg(media)

@@ -2,10 +2,11 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -87,12 +88,35 @@ struct ProbeOutput {
 struct ProbeStream {
     codec_type: String,
     codec_name: String,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    level: Option<i32>,
+    #[serde(default)]
+    pix_fmt: Option<String>,
+    #[serde(default)]
+    r_frame_rate: Option<String>,
+    #[serde(default)]
+    bit_rate: Option<String>,
+    #[serde(default)]
+    has_b_frames: Option<u32>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct PrimaryCodecs {
-    video: Option<String>,
-    audio: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamProperties {
+    codec: String,
+    profile: Option<String>,
+    level: Option<i32>,
+    pixel_format: Option<String>,
+    frame_rate: Option<String>,
+    bit_rate: Option<u64>,
+    b_frames: Option<u32>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PrimaryStreams {
+    video: Option<StreamProperties>,
+    audio: Option<StreamProperties>,
 }
 
 pub struct ExportRequest<'a> {
@@ -119,24 +143,26 @@ pub fn export_edited_media(
     check_cancelled(cancelled)?;
     on_progress(export_progress(8, "正在分析原始媒体"));
 
-    let codecs = probe_primary_codecs(request.ffprobe, request.source)?;
+    let streams = probe_primary_streams(request.ffprobe, request.source)?;
     let timeline = build_export_timeline(request.segments).map_err(ExportError::Timeline)?;
     let filter = build_filter_graph(&timeline, request.media_kind);
-    let video_encoder = match request.media_kind {
-        MediaKind::Video => Some(video_encoder(
-            codecs
+    let video = match request.media_kind {
+        MediaKind::Video => Some(
+            streams
                 .video
-                .as_deref()
+                .as_ref()
                 .ok_or(ExportError::MissingStream("视频"))?,
-        )?),
+        ),
         MediaKind::Audio => None,
     };
-    let audio_encoder = audio_encoder(
-        codecs
-            .audio
-            .as_deref()
-            .ok_or(ExportError::MissingStream("音频"))?,
-    )?;
+    let audio = streams
+        .audio
+        .as_ref()
+        .ok_or(ExportError::MissingStream("音频"))?;
+    if let Some(video) = video {
+        video_encoder(&video.codec)?;
+    }
+    audio_encoder(&audio.codec)?;
 
     let temporary_media = temporary_output_path(request.destination);
     let subtitle_path = request.destination.with_extension("srt");
@@ -150,10 +176,17 @@ pub fn export_edited_media(
         &temporary_media,
         request.media_kind,
         &filter,
-        video_encoder,
-        audio_encoder,
+        video,
+        audio,
     );
-    if let Err(error) = run_ffmpeg(request.ffmpeg, &arguments, cancelled) {
+    if let Err(error) = run_ffmpeg(
+        request.ffmpeg,
+        &arguments,
+        timeline.duration_samples(),
+        timeline.sample_rate,
+        cancelled,
+        &mut on_progress,
+    ) {
         let _ = fs::remove_file(&temporary_media);
         return Err(error);
     }
@@ -224,12 +257,14 @@ fn extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn probe_primary_codecs(ffprobe: &Path, source: &Path) -> Result<PrimaryCodecs, ExportError> {
+fn probe_primary_streams(ffprobe: &Path, source: &Path) -> Result<PrimaryStreams, ExportError> {
     let output = Command::new(ffprobe)
         .arg("-v")
         .arg("error")
         .arg("-show_entries")
-        .arg("stream=codec_type,codec_name")
+        .arg(
+            "stream=codec_type,codec_name,profile,level,pix_fmt,r_frame_rate,bit_rate,has_b_frames",
+        )
         .arg("-of")
         .arg("json")
         .arg(source)
@@ -241,17 +276,33 @@ fn probe_primary_codecs(ffprobe: &Path, source: &Path) -> Result<PrimaryCodecs, 
         ));
     }
 
-    let probe: ProbeOutput = serde_json::from_slice(&output.stdout)
+    parse_primary_streams(&output.stdout)
+}
+
+fn parse_primary_streams(output: &[u8]) -> Result<PrimaryStreams, ExportError> {
+    let probe: ProbeOutput = serde_json::from_slice(output)
         .map_err(|error| ExportError::ProbeFailed(error.to_string()))?;
-    let mut codecs = PrimaryCodecs::default();
+    let mut streams = PrimaryStreams::default();
     for stream in probe.streams {
+        let properties = StreamProperties {
+            codec: stream.codec_name,
+            profile: stream.profile,
+            level: stream.level,
+            pixel_format: stream.pix_fmt,
+            frame_rate: stream.r_frame_rate,
+            bit_rate: stream
+                .bit_rate
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            b_frames: stream.has_b_frames,
+        };
         match stream.codec_type.as_str() {
-            "video" if codecs.video.is_none() => codecs.video = Some(stream.codec_name),
-            "audio" if codecs.audio.is_none() => codecs.audio = Some(stream.codec_name),
+            "video" if streams.video.is_none() => streams.video = Some(properties),
+            "audio" if streams.audio.is_none() => streams.audio = Some(properties),
             _ => {}
         }
     }
-    Ok(codecs)
+    Ok(streams)
 }
 
 fn video_encoder(codec: &str) -> Result<&'static str, ExportError> {
@@ -327,13 +378,18 @@ fn build_ffmpeg_arguments(
     destination: &Path,
     media_kind: MediaKind,
     filter: &str,
-    video_encoder: Option<&str>,
-    audio_encoder: &str,
+    video: Option<&StreamProperties>,
+    audio: &StreamProperties,
 ) -> Vec<OsString> {
     let mut arguments = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        "-nostats".into(),
+        "-stats_period".into(),
+        "0.2".into(),
+        "-progress".into(),
+        "pipe:1".into(),
         "-y".into(),
         "-i".into(),
         source.as_os_str().to_owned(),
@@ -347,49 +403,153 @@ fn build_ffmpeg_arguments(
             "-map".into(),
             "[outa]".into(),
             "-c:v".into(),
-            video_encoder.expect("video export requires encoder").into(),
+            video_encoder(&video.expect("video export requires stream").codec)
+                .expect("validated video codec")
+                .into(),
         ]);
+        append_video_encoding_arguments(&mut arguments, video.expect("checked above"));
     } else {
         arguments.extend(["-map".into(), "[outa]".into()]);
     }
     arguments.extend([
         "-c:a".into(),
-        audio_encoder.into(),
-        destination.as_os_str().to_owned(),
+        audio_encoder(&audio.codec)
+            .expect("validated audio codec")
+            .into(),
     ]);
+    if matches!(audio.codec.as_str(), "aac" | "mp3") {
+        if let Some(bit_rate) = audio.bit_rate {
+            arguments.extend(["-b:a".into(), bit_rate.to_string().into()]);
+        }
+    }
+    arguments.push(destination.as_os_str().to_owned());
     arguments
+}
+
+fn append_video_encoding_arguments(arguments: &mut Vec<OsString>, video: &StreamProperties) {
+    if let Some(bit_rate) = video.bit_rate {
+        arguments.extend(["-b:v".into(), bit_rate.to_string().into()]);
+    }
+    if let Some(pixel_format) = &video.pixel_format {
+        arguments.extend(["-pix_fmt".into(), pixel_format.into()]);
+    }
+    if let Some(profile) = video_profile_argument(&video.codec, video.profile.as_deref()) {
+        arguments.extend(["-profile:v".into(), profile.into()]);
+    }
+    if video.codec == "h264" {
+        if let Some(level) = video.level {
+            arguments.extend(["-level:v".into(), level.to_string().into()]);
+        }
+    }
+    if let Some(b_frames) = video.b_frames {
+        arguments.extend(["-bf".into(), b_frames.to_string().into()]);
+    }
+    if let Some(gop_size) = video
+        .frame_rate
+        .as_deref()
+        .and_then(frame_rate_as_f64)
+        .map(f64::round)
+        .filter(|value| *value >= 1.0)
+    {
+        arguments.extend(["-g".into(), (gop_size as u64).to_string().into()]);
+    }
+}
+
+fn video_profile_argument(codec: &str, profile: Option<&str>) -> Option<&'static str> {
+    match (codec, profile?) {
+        ("h264", "Baseline") => Some("baseline"),
+        ("h264", "Constrained Baseline") => Some("constrained_baseline"),
+        ("h264", "Main") => Some("main"),
+        ("h264", "High") => Some("high"),
+        ("hevc", "Main") => Some("main"),
+        ("hevc", "Main 10") => Some("main10"),
+        ("prores", "Proxy") => Some("0"),
+        ("prores", "LT") => Some("1"),
+        ("prores", "Standard") => Some("2"),
+        ("prores", "HQ") => Some("3"),
+        ("prores", "4444") => Some("4"),
+        ("prores", "XQ") | ("prores", "4444 XQ") => Some("5"),
+        _ => None,
+    }
+}
+
+fn frame_rate_as_f64(value: &str) -> Option<f64> {
+    let (numerator, denominator) = value.split_once('/')?;
+    let numerator = numerator.parse::<f64>().ok()?;
+    let denominator = denominator.parse::<f64>().ok()?;
+    (denominator != 0.0).then_some(numerator / denominator)
 }
 
 fn run_ffmpeg(
     ffmpeg: &Path,
     arguments: &[OsString],
+    duration_samples: u64,
+    sample_rate: u32,
     cancelled: &AtomicBool,
+    on_progress: &mut dyn FnMut(ExportProgress),
 ) -> Result<(), ExportError> {
     let mut child = Command::new(ffmpeg)
         .args(arguments)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(ExportError::Io)?;
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout is piped for FFmpeg progress");
     let mut stderr = child
         .stderr
         .take()
         .expect("stderr is piped for FFmpeg diagnostics");
+    let (progress_sender, progress_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || -> std::io::Result<()> {
+        for line in BufReader::new(stdout).lines() {
+            if progress_sender.send(line?).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
     let stderr_reader = thread::spawn(move || {
         let mut output = Vec::new();
         stderr.read_to_end(&mut output).map(|_| output)
     });
+    let mut last_percent = 18;
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(ExportError::Cancelled);
         }
+        while let Ok(line) = progress_receiver.try_recv() {
+            report_ffmpeg_progress(
+                &line,
+                duration_samples,
+                sample_rate,
+                &mut last_percent,
+                on_progress,
+            );
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
+                let stdout_result = stdout_reader.join().map_err(|_| {
+                    ExportError::Io(std::io::Error::other("读取 FFmpeg 进度输出的线程异常终止"))
+                })?;
+                stdout_result.map_err(ExportError::Io)?;
+                while let Ok(line) = progress_receiver.try_recv() {
+                    report_ffmpeg_progress(
+                        &line,
+                        duration_samples,
+                        sample_rate,
+                        &mut last_percent,
+                        on_progress,
+                    );
+                }
                 let output = stderr_reader
                     .join()
                     .map_err(|_| {
@@ -406,12 +566,46 @@ fn run_ffmpeg(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
                 return Err(ExportError::Io(error));
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+fn report_ffmpeg_progress(
+    line: &str,
+    duration_samples: u64,
+    sample_rate: u32,
+    last_percent: &mut u8,
+    on_progress: &mut dyn FnMut(ExportProgress),
+) {
+    let Some(out_time_us) = line
+        .strip_prefix("out_time_us=")
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let percent = ffmpeg_export_percent(out_time_us, duration_samples, sample_rate);
+    if percent > *last_percent {
+        *last_percent = percent;
+        on_progress(export_progress(percent, "正在拼接保留片段"));
+    }
+}
+
+fn ffmpeg_export_percent(out_time_us: u64, duration_samples: u64, sample_rate: u32) -> u8 {
+    if duration_samples == 0 || sample_rate == 0 {
+        return 18;
+    }
+    let duration_us = duration_samples as u128 * 1_000_000_u128 / u128::from(sample_rate);
+    if duration_us == 0 {
+        return 18;
+    }
+    let completed = u128::from(out_time_us).min(duration_us);
+    let encoding_percent = completed * 74 / duration_us;
+    (18 + encoding_percent as u8).min(92)
 }
 
 fn temporary_output_path(path: &Path) -> PathBuf {
@@ -520,8 +714,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        audio_encoder, backup_output_path, build_filter_graph, replace_export_files,
-        temporary_output_path, validate_container, video_encoder, ExportError,
+        audio_encoder, backup_output_path, build_ffmpeg_arguments, build_filter_graph,
+        ffmpeg_export_percent, parse_primary_streams, replace_export_files, report_ffmpeg_progress,
+        temporary_output_path, validate_container, video_encoder, video_profile_argument,
+        ExportError, StreamProperties,
     };
     use crate::domain::export::build_export_timeline;
     use crate::domain::transcript::TranscriptSegment;
@@ -575,6 +771,135 @@ mod tests {
     }
 
     #[test]
+    fn parses_encoding_properties_from_ffprobe_json() {
+        let streams = parse_primary_streams(
+            br#"{
+                "streams": [
+                    {
+                        "codec_type": "video",
+                        "codec_name": "h264",
+                        "profile": "High",
+                        "level": 51,
+                        "pix_fmt": "yuv420p",
+                        "r_frame_rate": "30/1",
+                        "bit_rate": "25533777",
+                        "has_b_frames": 2
+                    },
+                    {
+                        "codec_type": "audio",
+                        "codec_name": "aac",
+                        "bit_rate": "192000"
+                    }
+                ]
+            }"#,
+        )
+        .expect("probe");
+
+        assert_eq!(
+            streams.video,
+            Some(StreamProperties {
+                codec: "h264".into(),
+                profile: Some("High".into()),
+                level: Some(51),
+                pixel_format: Some("yuv420p".into()),
+                frame_rate: Some("30/1".into()),
+                bit_rate: Some(25_533_777),
+                b_frames: Some(2),
+            })
+        );
+        assert_eq!(streams.audio.expect("audio").bit_rate, Some(192_000));
+    }
+
+    #[test]
+    fn preserves_h264_rate_control_and_compression_properties() {
+        let video = StreamProperties {
+            codec: "h264".into(),
+            profile: Some("High".into()),
+            level: Some(51),
+            pixel_format: Some("yuv420p".into()),
+            frame_rate: Some("30/1".into()),
+            bit_rate: Some(25_533_777),
+            b_frames: Some(2),
+        };
+        let audio = StreamProperties {
+            codec: "aac".into(),
+            profile: None,
+            level: None,
+            pixel_format: None,
+            frame_rate: None,
+            bit_rate: Some(192_000),
+            b_frames: None,
+        };
+
+        let arguments = build_ffmpeg_arguments(
+            Path::new("source.mov"),
+            Path::new("output.mov"),
+            MediaKind::Video,
+            "filter",
+            Some(&video),
+            &audio,
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+        assert_option(
+            &arguments,
+            "-c:v",
+            video_encoder("h264").expect("h264 encoder"),
+        );
+        assert_option(&arguments, "-b:v", "25533777");
+        assert_option(&arguments, "-profile:v", "high");
+        assert_option(&arguments, "-level:v", "51");
+        assert_option(&arguments, "-pix_fmt", "yuv420p");
+        assert_option(&arguments, "-bf", "2");
+        assert_option(&arguments, "-g", "30");
+        assert_option(&arguments, "-b:a", "192000");
+        assert_option(&arguments, "-progress", "pipe:1");
+    }
+
+    #[test]
+    fn preserves_prores_profiles() {
+        assert_eq!(video_profile_argument("prores", Some("Proxy")), Some("0"));
+        assert_eq!(video_profile_argument("prores", Some("LT")), Some("1"));
+        assert_eq!(
+            video_profile_argument("prores", Some("Standard")),
+            Some("2")
+        );
+        assert_eq!(video_profile_argument("prores", Some("HQ")), Some("3"));
+        assert_eq!(video_profile_argument("prores", Some("4444")), Some("4"));
+        assert_eq!(video_profile_argument("prores", Some("4444 XQ")), Some("5"));
+    }
+
+    #[test]
+    fn maps_ffmpeg_output_time_to_the_encoding_progress_range() {
+        assert_eq!(ffmpeg_export_percent(0, 160_000, 16_000), 18);
+        assert_eq!(ffmpeg_export_percent(5_000_000, 160_000, 16_000), 55);
+        assert_eq!(ffmpeg_export_percent(10_000_000, 160_000, 16_000), 92);
+        assert_eq!(ffmpeg_export_percent(20_000_000, 160_000, 16_000), 92);
+        assert_eq!(ffmpeg_export_percent(1, 1, 2_000_000), 18);
+    }
+
+    #[test]
+    fn reports_only_monotonically_increasing_ffmpeg_progress() {
+        let mut last_percent = 18;
+        let mut updates = Vec::new();
+        for line in [
+            "out_time_us=N/A",
+            "out_time_us=2500000",
+            "out_time_us=5000000",
+            "out_time_us=4000000",
+            "progress=continue",
+        ] {
+            report_ffmpeg_progress(line, 160_000, 16_000, &mut last_percent, &mut |progress| {
+                updates.push(progress.percent)
+            });
+        }
+
+        assert_eq!(updates, vec![36, 55]);
+    }
+
+    #[test]
     fn requires_the_destination_container_to_match_the_source() {
         assert!(validate_container(Path::new("source.MOV"), Path::new("output.mov")).is_ok());
         assert!(matches!(
@@ -621,5 +946,13 @@ mod tests {
 
     fn segment(id: u32, start: u64, end: u64) -> TranscriptSegment {
         TranscriptSegment::new(id, start, end, 16_000, format!("第{id}句"))
+    }
+
+    fn assert_option(arguments: &[String], option: &str, expected: &str) {
+        let index = arguments
+            .iter()
+            .position(|argument| argument == option)
+            .unwrap_or_else(|| panic!("missing argument {option}"));
+        assert_eq!(arguments.get(index + 1).map(String::as_str), Some(expected));
     }
 }
