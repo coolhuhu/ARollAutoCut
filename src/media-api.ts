@@ -36,9 +36,21 @@ export interface ExportProgress {
   message: string;
 }
 
+export type ExportMode =
+  | "videoWithSubtitle"
+  | "audioWithSubtitle"
+  | "audioOnly"
+  | "subtitleOnly";
+
+export type ExportFileKind = "video" | "audio" | "subtitle";
+
+export interface ExportedFile {
+  kind: ExportFileKind;
+  path: string;
+}
+
 export interface ExportResult {
-  mediaPath: string;
-  subtitlePath: string;
+  files: ExportedFile[];
 }
 
 function isTauriRuntime(): boolean {
@@ -92,14 +104,22 @@ export async function cancelTranscription(): Promise<boolean> {
 
 export async function chooseExportDestination(
   sourcePath: string,
+  mode: ExportMode,
+  audioExtension?: string,
 ): Promise<string | null> {
   if (!isTauriRuntime()) {
     return null;
   }
-  const extension = sourcePath.split(".").pop()?.toLowerCase() ?? "";
+  const extension = exportExtension(sourcePath, mode, audioExtension);
+  const title =
+    mode === "subtitleOnly"
+      ? "导出字幕文件"
+      : mode === "videoWithSubtitle"
+        ? "导出剪辑后的视频"
+        : "导出剪辑后的音频";
   return save({
-    title: "导出剪辑后的媒体",
-    defaultPath: defaultExportName(sourcePath),
+    title,
+    defaultPath: defaultExportName(sourcePath, mode, audioExtension),
     filters: extension
       ? [{ name: `${extension.toUpperCase()} 文件`, extensions: [extension] }]
       : undefined,
@@ -110,6 +130,7 @@ export async function exportEditedMedia(
   sourcePath: string,
   destinationPath: string,
   mediaKind: "audio" | "video",
+  mode: ExportMode,
   segments: TranscriptSegment[],
   onProgress: (progress: ExportProgress) => void,
 ): Promise<ExportResult> {
@@ -125,11 +146,21 @@ export async function exportEditedMedia(
       sourcePath,
       destinationPath,
       mediaKind,
+      mode,
       segments,
     });
   } finally {
     unlisten();
   }
+}
+
+export async function getAudioExportExtension(
+  sourcePath: string,
+): Promise<string> {
+  if (!isTauriRuntime()) {
+    throw new Error("请在 Tauri App 中读取音频编码信息");
+  }
+  return invoke<string>("get_audio_export_extension", { sourcePath });
 }
 
 export async function cancelExport(): Promise<boolean> {
@@ -248,11 +279,45 @@ export function formatMediaTimestamp(
     .concat(`,${milliseconds.toString().padStart(3, "0")}`);
 }
 
-export function defaultExportName(sourcePath: string): string {
+export function defaultExportName(
+  sourcePath: string,
+  mode: ExportMode,
+  audioExtension?: string,
+): string {
   const fileName = sourcePath.split(/[/\\]/).pop() || "output";
   const separator = fileName.lastIndexOf(".");
-  if (separator <= 0) {
-    return `${fileName}-cut`;
+  const stem = separator <= 0 ? fileName : fileName.slice(0, separator);
+  const sourceExtension = separator <= 0 ? "" : fileName.slice(separator + 1);
+
+  if (mode === "subtitleOnly") {
+    return `${stem}-cut.srt`;
   }
-  return `${fileName.slice(0, separator)}-cut${fileName.slice(separator)}`;
+  if (
+    (mode === "audioWithSubtitle" || mode === "audioOnly") &&
+    audioExtension
+  ) {
+    return `${stem}-cut-audio.${audioExtension}`;
+  }
+  return sourceExtension
+    ? `${stem}-cut.${sourceExtension}`
+    : `${stem}-cut`;
+}
+
+function exportExtension(
+  sourcePath: string,
+  mode: ExportMode,
+  audioExtension?: string,
+): string {
+  if (mode === "subtitleOnly") {
+    return "srt";
+  }
+  if (
+    (mode === "audioWithSubtitle" || mode === "audioOnly") &&
+    audioExtension
+  ) {
+    return audioExtension.toLowerCase();
+  }
+  const fileName = sourcePath.split(/[/\\]/).pop() ?? "";
+  const separator = fileName.lastIndexOf(".");
+  return separator <= 0 ? "" : fileName.slice(separator + 1).toLowerCase();
 }

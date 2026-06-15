@@ -12,17 +12,56 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::export::{build_export_timeline, ExportTimeline, ExportTimelineError};
+use crate::domain::export::{
+    build_export_timeline, build_original_subtitle_cues, ExportTimeline, ExportTimelineError,
+};
 use crate::domain::transcript::TranscriptSegment;
 
 use super::subtitle::render_srt;
 use super::transcription::MediaKind;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportMode {
+    VideoWithSubtitle,
+    AudioWithSubtitle,
+    AudioOnly,
+    SubtitleOnly,
+}
+
+impl ExportMode {
+    pub fn requires_media_tools(self) -> bool {
+        self != Self::SubtitleOnly
+    }
+
+    fn exports_video(self) -> bool {
+        self == Self::VideoWithSubtitle
+    }
+
+    fn exports_subtitle(self) -> bool {
+        matches!(self, Self::VideoWithSubtitle | Self::AudioWithSubtitle)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFileKind {
+    Video,
+    Audio,
+    Subtitle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportedFile {
+    pub kind: ExportFileKind,
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExportResult {
-    pub media_path: PathBuf,
-    pub subtitle_path: PathBuf,
+    pub files: Vec<ExportedFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,11 +75,24 @@ pub struct ExportProgress {
 pub enum ExportError {
     SourceNotFound(PathBuf),
     InvalidDestination(PathBuf),
-    ContainerMismatch { source: String, destination: String },
-    MissingExecutable { name: &'static str, path: PathBuf },
+    ContainerMismatch {
+        source: String,
+        destination: String,
+    },
+    UnsupportedExportMode {
+        media_kind: MediaKind,
+        mode: ExportMode,
+    },
+    MissingExecutable {
+        name: &'static str,
+        path: PathBuf,
+    },
     ProbeFailed(String),
     MissingStream(&'static str),
-    UnsupportedCodec { stream: &'static str, codec: String },
+    UnsupportedCodec {
+        stream: &'static str,
+        codec: String,
+    },
     Timeline(ExportTimelineError),
     Io(std::io::Error),
     FfmpegFailed(String),
@@ -59,8 +111,11 @@ impl fmt::Display for ExportError {
                 destination,
             } => write!(
                 formatter,
-                "导出格式必须与原文件一致：原文件为 {source}，目标为 {destination}"
+                "导出文件扩展名应为 {source}，当前选择的是 {destination}"
             ),
+            Self::UnsupportedExportMode { media_kind, mode } => {
+                write!(formatter, "{media_kind:?} 输入不支持 {mode:?} 导出模式")
+            }
             Self::MissingExecutable { name, path } => {
                 write!(formatter, "{name} sidecar 不存在：{}", path.display())
             }
@@ -120,11 +175,12 @@ struct PrimaryStreams {
 }
 
 pub struct ExportRequest<'a> {
-    pub ffmpeg: &'a Path,
-    pub ffprobe: &'a Path,
+    pub ffmpeg: Option<&'a Path>,
+    pub ffprobe: Option<&'a Path>,
     pub source: &'a Path,
     pub destination: &'a Path,
     pub media_kind: MediaKind,
+    pub mode: ExportMode,
     pub segments: &'a [TranscriptSegment],
 }
 
@@ -133,20 +189,56 @@ pub fn export_edited_media(
     cancelled: &AtomicBool,
     mut on_progress: impl FnMut(ExportProgress),
 ) -> Result<ExportResult, ExportError> {
-    validate_paths(
-        request.ffmpeg,
-        request.ffprobe,
-        request.source,
-        request.destination,
-    )?;
-    validate_container(request.source, request.destination)?;
+    validate_source_destination(request.source, request.destination)?;
+    validate_export_mode(request.media_kind, request.mode)?;
     check_cancelled(cancelled)?;
+
+    if request.mode == ExportMode::SubtitleOnly {
+        validate_destination_extension(request.destination, "srt")?;
+        on_progress(export_progress(20, "正在整理字幕时间轴"));
+        let cues = build_original_subtitle_cues(request.segments).map_err(ExportError::Timeline)?;
+        check_cancelled(cancelled)?;
+        let temporary_subtitle = temporary_output_path(request.destination);
+        remove_if_exists(&temporary_subtitle)?;
+        on_progress(export_progress(80, "正在生成字幕文件"));
+        fs::write(&temporary_subtitle, render_srt(&cues)).map_err(ExportError::Io)?;
+        if let Err(error) = replace_export_file(&temporary_subtitle, request.destination) {
+            let _ = fs::remove_file(&temporary_subtitle);
+            return Err(error);
+        }
+        on_progress(export_progress(100, "导出完成"));
+        return Ok(ExportResult {
+            files: vec![ExportedFile {
+                kind: ExportFileKind::Subtitle,
+                path: request.destination.into(),
+            }],
+        });
+    }
+
+    let ffmpeg = request
+        .ffmpeg
+        .ok_or_else(|| ExportError::MissingExecutable {
+            name: "ffmpeg",
+            path: PathBuf::from("ffmpeg"),
+        })?;
+    let ffprobe = request
+        .ffprobe
+        .ok_or_else(|| ExportError::MissingExecutable {
+            name: "ffprobe",
+            path: PathBuf::from("ffprobe"),
+        })?;
+    validate_media_tools(ffmpeg, ffprobe)?;
     on_progress(export_progress(8, "正在分析原始媒体"));
 
-    let streams = probe_primary_streams(request.ffprobe, request.source)?;
+    let streams = probe_primary_streams(ffprobe, request.source)?;
     let timeline = build_export_timeline(request.segments).map_err(ExportError::Timeline)?;
-    let filter = build_filter_graph(&timeline, request.media_kind);
-    let video = match request.media_kind {
+    let output_kind = if request.mode.exports_video() {
+        MediaKind::Video
+    } else {
+        MediaKind::Audio
+    };
+    let filter = build_filter_graph(&timeline, output_kind);
+    let video = match output_kind {
         MediaKind::Video => Some(
             streams
                 .video
@@ -163,24 +255,33 @@ pub fn export_edited_media(
         video_encoder(&video.codec)?;
     }
     audio_encoder(&audio.codec)?;
+    validate_media_destination(
+        request.source,
+        request.destination,
+        request.media_kind,
+        request.mode,
+        &audio.codec,
+    )?;
 
     let temporary_media = temporary_output_path(request.destination);
     let subtitle_path = request.destination.with_extension("srt");
     let temporary_subtitle = temporary_output_path(&subtitle_path);
     remove_if_exists(&temporary_media)?;
-    remove_if_exists(&temporary_subtitle)?;
+    if request.mode.exports_subtitle() {
+        remove_if_exists(&temporary_subtitle)?;
+    }
     on_progress(export_progress(18, "正在拼接保留片段"));
 
     let arguments = build_ffmpeg_arguments(
         request.source,
         &temporary_media,
-        request.media_kind,
+        output_kind,
         &filter,
         video,
         audio,
     );
     if let Err(error) = run_ffmpeg(
-        request.ffmpeg,
+        ffmpeg,
         &arguments,
         timeline.duration_samples(),
         timeline.sample_rate,
@@ -191,44 +292,46 @@ pub fn export_edited_media(
         return Err(error);
     }
 
-    on_progress(export_progress(92, "正在生成字幕文件"));
-    if let Err(error) = fs::write(&temporary_subtitle, render_srt(&timeline.cues)) {
+    let media_kind = if request.mode.exports_video() {
+        ExportFileKind::Video
+    } else {
+        ExportFileKind::Audio
+    };
+    let mut files = vec![ExportedFile {
+        kind: media_kind,
+        path: request.destination.into(),
+    }];
+    if request.mode.exports_subtitle() {
+        on_progress(export_progress(92, "正在生成字幕文件"));
+        if let Err(error) = fs::write(&temporary_subtitle, render_srt(&timeline.cues)) {
+            let _ = fs::remove_file(&temporary_media);
+            let _ = fs::remove_file(&temporary_subtitle);
+            return Err(ExportError::Io(error));
+        }
+        if let Err(error) = replace_export_files(
+            &temporary_media,
+            request.destination,
+            &temporary_subtitle,
+            &subtitle_path,
+        ) {
+            let _ = fs::remove_file(&temporary_media);
+            let _ = fs::remove_file(&temporary_subtitle);
+            return Err(error);
+        }
+        files.push(ExportedFile {
+            kind: ExportFileKind::Subtitle,
+            path: subtitle_path,
+        });
+    } else if let Err(error) = replace_export_file(&temporary_media, request.destination) {
         let _ = fs::remove_file(&temporary_media);
-        let _ = fs::remove_file(&temporary_subtitle);
-        return Err(ExportError::Io(error));
-    }
-    if let Err(error) = replace_export_files(
-        &temporary_media,
-        request.destination,
-        &temporary_subtitle,
-        &subtitle_path,
-    ) {
-        let _ = fs::remove_file(&temporary_media);
-        let _ = fs::remove_file(&temporary_subtitle);
         return Err(error);
     }
     on_progress(export_progress(100, "导出完成"));
 
-    Ok(ExportResult {
-        media_path: request.destination.into(),
-        subtitle_path,
-    })
+    Ok(ExportResult { files })
 }
 
-fn validate_paths(
-    ffmpeg: &Path,
-    ffprobe: &Path,
-    source: &Path,
-    destination: &Path,
-) -> Result<(), ExportError> {
-    for (name, path) in [("ffmpeg", ffmpeg), ("ffprobe", ffprobe)] {
-        if !path.is_file() {
-            return Err(ExportError::MissingExecutable {
-                name,
-                path: path.into(),
-            });
-        }
-    }
+fn validate_source_destination(source: &Path, destination: &Path) -> Result<(), ExportError> {
     if !source.is_file() {
         return Err(ExportError::SourceNotFound(source.into()));
     }
@@ -238,13 +341,55 @@ fn validate_paths(
     Ok(())
 }
 
-fn validate_container(source: &Path, destination: &Path) -> Result<(), ExportError> {
-    let source_extension = extension(source);
-    let destination_extension = extension(destination);
-    if source_extension != destination_extension {
+fn validate_media_tools(ffmpeg: &Path, ffprobe: &Path) -> Result<(), ExportError> {
+    for (name, path) in [("ffmpeg", ffmpeg), ("ffprobe", ffprobe)] {
+        if !path.is_file() {
+            return Err(ExportError::MissingExecutable {
+                name,
+                path: path.into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_export_mode(media_kind: MediaKind, mode: ExportMode) -> Result<(), ExportError> {
+    let supported = matches!(
+        (media_kind, mode),
+        (MediaKind::Video, ExportMode::VideoWithSubtitle)
+            | (MediaKind::Video, ExportMode::AudioWithSubtitle)
+            | (MediaKind::Video, ExportMode::AudioOnly)
+            | (MediaKind::Audio, ExportMode::AudioWithSubtitle)
+            | (MediaKind::Audio, ExportMode::SubtitleOnly)
+    );
+    if supported {
+        Ok(())
+    } else {
+        Err(ExportError::UnsupportedExportMode { media_kind, mode })
+    }
+}
+
+fn validate_media_destination(
+    source: &Path,
+    destination: &Path,
+    media_kind: MediaKind,
+    mode: ExportMode,
+    audio_codec: &str,
+) -> Result<(), ExportError> {
+    let expected = if mode.exports_video() || media_kind == MediaKind::Audio {
+        extension(source)
+    } else {
+        audio_container_extension(audio_codec)?.to_owned()
+    };
+    validate_destination_extension(destination, &expected)
+}
+
+fn validate_destination_extension(destination: &Path, expected: &str) -> Result<(), ExportError> {
+    let actual = extension(destination);
+    if actual != expected {
         return Err(ExportError::ContainerMismatch {
-            source: source_extension,
-            destination: destination_extension,
+            source: expected.to_owned(),
+            destination: actual,
         });
     }
     Ok(())
@@ -255,6 +400,37 @@ fn extension(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("无扩展名")
         .to_ascii_lowercase()
+}
+
+pub fn audio_export_extension(ffprobe: &Path, source: &Path) -> Result<String, ExportError> {
+    if !source.is_file() {
+        return Err(ExportError::SourceNotFound(source.into()));
+    }
+    if !ffprobe.is_file() {
+        return Err(ExportError::MissingExecutable {
+            name: "ffprobe",
+            path: ffprobe.into(),
+        });
+    }
+    let streams = probe_primary_streams(ffprobe, source)?;
+    let audio = streams
+        .audio
+        .as_ref()
+        .ok_or(ExportError::MissingStream("音频"))?;
+    Ok(audio_container_extension(&audio.codec)?.to_owned())
+}
+
+fn audio_container_extension(codec: &str) -> Result<&'static str, ExportError> {
+    match codec {
+        "aac" | "alac" => Ok("m4a"),
+        "mp3" => Ok("mp3"),
+        "flac" => Ok("flac"),
+        "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" => Ok("wav"),
+        _ => Err(ExportError::UnsupportedCodec {
+            stream: "音频",
+            codec: codec.to_owned(),
+        }),
+    }
 }
 
 fn probe_primary_streams(ffprobe: &Path, source: &Path) -> Result<PrimaryStreams, ExportError> {
@@ -653,6 +829,18 @@ fn replace_export_files(
     Ok(())
 }
 
+fn replace_export_file(temporary: &Path, destination: &Path) -> Result<(), ExportError> {
+    let backup = backup_existing_file(destination)?;
+    if let Err(error) = fs::rename(temporary, destination) {
+        restore_backup(destination, backup.as_deref());
+        return Err(ExportError::Io(error));
+    }
+    if let Some(backup) = backup {
+        let _ = fs::remove_file(backup);
+    }
+    Ok(())
+}
+
 fn backup_existing_file(path: &Path) -> Result<Option<PathBuf>, ExportError> {
     if !path.exists() {
         return Ok(None);
@@ -714,10 +902,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        audio_encoder, backup_output_path, build_ffmpeg_arguments, build_filter_graph,
-        ffmpeg_export_percent, parse_primary_streams, replace_export_files, report_ffmpeg_progress,
-        temporary_output_path, validate_container, video_encoder, video_profile_argument,
-        ExportError, StreamProperties,
+        audio_container_extension, audio_encoder, backup_output_path, build_ffmpeg_arguments,
+        build_filter_graph, ffmpeg_export_percent, parse_primary_streams, replace_export_files,
+        report_ffmpeg_progress, temporary_output_path, validate_destination_extension,
+        validate_export_mode, video_encoder, video_profile_argument, ExportError, ExportMode,
+        StreamProperties,
     };
     use crate::domain::export::build_export_timeline;
     use crate::domain::transcript::TranscriptSegment;
@@ -767,6 +956,35 @@ mod tests {
         assert!(matches!(
             audio_encoder("opus"),
             Err(ExportError::UnsupportedCodec { .. })
+        ));
+    }
+
+    #[test]
+    fn maps_source_audio_codecs_to_supported_output_containers() {
+        assert_eq!(audio_container_extension("aac").expect("aac"), "m4a");
+        assert_eq!(audio_container_extension("alac").expect("alac"), "m4a");
+        assert_eq!(audio_container_extension("mp3").expect("mp3"), "mp3");
+        assert_eq!(audio_container_extension("flac").expect("flac"), "flac");
+        assert_eq!(audio_container_extension("pcm_s24le").expect("pcm"), "wav");
+        assert!(matches!(
+            audio_container_extension("opus"),
+            Err(ExportError::UnsupportedCodec { .. })
+        ));
+    }
+
+    #[test]
+    fn only_allows_export_modes_supported_by_the_input_kind() {
+        assert!(validate_export_mode(MediaKind::Video, ExportMode::VideoWithSubtitle).is_ok());
+        assert!(validate_export_mode(MediaKind::Video, ExportMode::AudioOnly).is_ok());
+        assert!(validate_export_mode(MediaKind::Audio, ExportMode::AudioWithSubtitle).is_ok());
+        assert!(validate_export_mode(MediaKind::Audio, ExportMode::SubtitleOnly).is_ok());
+        assert!(matches!(
+            validate_export_mode(MediaKind::Audio, ExportMode::VideoWithSubtitle),
+            Err(ExportError::UnsupportedExportMode { .. })
+        ));
+        assert!(matches!(
+            validate_export_mode(MediaKind::Video, ExportMode::SubtitleOnly),
+            Err(ExportError::UnsupportedExportMode { .. })
         ));
     }
 
@@ -901,9 +1119,9 @@ mod tests {
 
     #[test]
     fn requires_the_destination_container_to_match_the_source() {
-        assert!(validate_container(Path::new("source.MOV"), Path::new("output.mov")).is_ok());
+        assert!(validate_destination_extension(Path::new("output.mov"), "mov").is_ok());
         assert!(matches!(
-            validate_container(Path::new("source.mov"), Path::new("output.mp4")),
+            validate_destination_extension(Path::new("output.mp4"), "mov"),
             Err(ExportError::ContainerMismatch { .. })
         ));
     }

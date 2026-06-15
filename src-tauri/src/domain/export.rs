@@ -138,6 +138,33 @@ pub fn build_export_timeline(
     })
 }
 
+pub fn build_original_subtitle_cues(
+    segments: &[TranscriptSegment],
+) -> Result<Vec<ExportCue>, ExportTimelineError> {
+    let mut retained: Vec<&TranscriptSegment> =
+        segments.iter().filter(|segment| segment.retained).collect();
+    if retained.is_empty() {
+        return Err(ExportTimelineError::NoRetainedSegments);
+    }
+    retained.sort_by_key(|segment| (segment.start_sample, segment.end_sample, segment.id));
+
+    let sample_rate = retained[0].sample_rate;
+    retained
+        .into_iter()
+        .enumerate()
+        .map(|(index, segment)| {
+            validate_segment(segment, sample_rate)?;
+            Ok(ExportCue {
+                index: index as u32 + 1,
+                start_sample: segment.start_sample,
+                end_sample: segment.end_sample,
+                sample_rate,
+                text: segment.edited_text.clone(),
+            })
+        })
+        .collect()
+}
+
 fn validate_segment(
     segment: &TranscriptSegment,
     expected_sample_rate: u32,
@@ -185,7 +212,9 @@ fn containing_range<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_export_timeline, ExportTimelineError, SampleRange};
+    use super::{
+        build_export_timeline, build_original_subtitle_cues, ExportTimelineError, SampleRange,
+    };
     use crate::domain::transcript::TranscriptSegment;
 
     #[test]
@@ -328,6 +357,23 @@ mod tests {
             build_export_timeline(&[first, second]),
             Err(ExportTimelineError::SampleRateMismatch { id: 2, .. })
         ));
+    }
+
+    #[test]
+    fn keeps_original_gaps_for_subtitle_only_exports() {
+        let first = segment(1, 100, 200, "第一句");
+        let mut deleted = segment(2, 200, 400, "删除");
+        deleted.delete();
+        let third = segment(3, 400, 500, "第三句");
+
+        let cues = build_original_subtitle_cues(&[third, deleted, first]).expect("original cues");
+
+        assert_eq!(
+            cues.iter()
+                .map(|cue| (cue.index, cue.start_sample, cue.end_sample))
+                .collect::<Vec<_>>(),
+            vec![(1, 100, 200), (2, 400, 500)]
+        );
     }
 
     fn segment(id: u32, start: u64, end: u64, text: &str) -> TranscriptSegment {

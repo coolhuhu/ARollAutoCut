@@ -20,13 +20,38 @@ describe("formatMediaTimestamp", () => {
 });
 
 describe("defaultExportName", () => {
-  it("keeps the source container extension", () => {
-    expect(defaultExportName("/Users/test/My Clip.MOV")).toBe("My Clip-cut.MOV");
-    expect(defaultExportName("C:\\Media\\voice.wav")).toBe("voice-cut.wav");
+  it("keeps the source container extension for default exports", () => {
+    expect(
+      defaultExportName("/Users/test/My Clip.MOV", "videoWithSubtitle"),
+    ).toBe("My Clip-cut.MOV");
+    expect(
+      defaultExportName("C:\\Media\\voice.wav", "audioWithSubtitle"),
+    ).toBe("voice-cut.wav");
+  });
+
+  it("names video audio exports with the detected audio container", () => {
+    expect(
+      defaultExportName(
+        "/Users/test/My Clip.mov",
+        "audioWithSubtitle",
+        "m4a",
+      ),
+    ).toBe("My Clip-cut-audio.m4a");
+    expect(
+      defaultExportName("/Users/test/My Clip.mov", "audioOnly", "wav"),
+    ).toBe("My Clip-cut-audio.wav");
+  });
+
+  it("uses an srt extension for subtitle-only exports", () => {
+    expect(defaultExportName("/tmp/recording.wav", "subtitleOnly")).toBe(
+      "recording-cut.srt",
+    );
   });
 
   it("supports files without an extension", () => {
-    expect(defaultExportName("/tmp/recording")).toBe("recording-cut");
+    expect(defaultExportName("/tmp/recording", "audioWithSubtitle")).toBe(
+      "recording-cut",
+    );
   });
 });
 

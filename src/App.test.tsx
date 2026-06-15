@@ -12,6 +12,7 @@ import {
   chooseExportDestination,
   chooseMediaFile,
   exportEditedMedia,
+  getAudioExportExtension,
   transcribeMedia,
 } from "./media-api";
 import { downloadModel, getModelStatus } from "./model-api";
@@ -36,6 +37,7 @@ vi.mock("./media-api", async (importOriginal) => {
     cancelTranscription: vi.fn(),
     chooseExportDestination: vi.fn(),
     exportEditedMedia: vi.fn(),
+    getAudioExportExtension: vi.fn(),
     cancelExport: vi.fn(),
     listenForMediaDrop: vi.fn().mockResolvedValue(() => {}),
     listenForAppClose: vi.fn().mockResolvedValue(() => {}),
@@ -47,6 +49,7 @@ describe("App", () => {
     vi.clearAllMocks();
     vi.mocked(chooseMediaFile).mockResolvedValue(null);
     vi.mocked(chooseExportDestination).mockResolvedValue(null);
+    vi.mocked(getAudioExportExtension).mockResolvedValue("m4a");
     vi.mocked(getModelStatus).mockResolvedValue({
       state: "missing",
       directory: "/App Data/models/sense-voice",
@@ -278,11 +281,13 @@ describe("App", () => {
       "/tmp/vad-test-cut.wav",
     );
     vi.mocked(exportEditedMedia).mockImplementation(
-      async (_source, _destination, _kind, _segments, onProgress) => {
+      async (_source, _destination, _kind, _mode, _segments, onProgress) => {
         onProgress({ percent: 92, message: "正在生成字幕文件" });
         return {
-          mediaPath: "/tmp/vad-test-cut.wav",
-          subtitlePath: "/tmp/vad-test-cut.srt",
+          files: [
+            { kind: "audio", path: "/tmp/vad-test-cut.wav" },
+            { kind: "subtitle", path: "/tmp/vad-test-cut.srt" },
+          ],
         };
       },
     );
@@ -295,6 +300,7 @@ describe("App", () => {
       "/tmp/vad-test.wav",
       "/tmp/vad-test-cut.wav",
       "audio",
+      "audioWithSubtitle",
       expect.arrayContaining([
         expect.objectContaining({
           id: 1,
@@ -302,6 +308,131 @@ describe("App", () => {
           retained: true,
         }),
       ]),
+      expect.any(Function),
+    );
+    expect(screen.getByText("音频文件")).toBeInTheDocument();
+    expect(screen.getByText("字幕文件")).toBeInTheDocument();
+  });
+
+  it("exports only subtitles from the audio export menu", async () => {
+    vi.mocked(getModelStatus).mockResolvedValue({
+      state: "ready",
+      directory: "/models/sense-voice",
+      issues: [],
+    });
+    vi.mocked(chooseMediaFile).mockResolvedValue("/tmp/voice.wav");
+    vi.mocked(transcribeMedia).mockResolvedValue({
+      sourcePath: "/tmp/voice.wav",
+      sourceName: "voice.wav",
+      mediaKind: "audio",
+      segments: [
+        {
+          id: 1,
+          startSample: 16_000,
+          endSample: 32_000,
+          sampleRate: 16_000,
+          originalText: "保留这一句",
+          editedText: "保留这一句",
+          retained: true,
+        },
+      ],
+    });
+    vi.mocked(chooseExportDestination).mockResolvedValue(
+      "/tmp/voice-cut.srt",
+    );
+    vi.mocked(exportEditedMedia).mockResolvedValue({
+      files: [{ kind: "subtitle", path: "/tmp/voice-cut.srt" }],
+    });
+
+    render(<App />);
+    const upload = await screen.findByRole("button", {
+      name: /点击上传或拖拽文件到此处/,
+    });
+    await waitFor(() => expect(upload).toBeEnabled());
+    fireEvent.click(upload);
+    await screen.findByRole("heading", { name: "保留需要的口播内容" });
+
+    fireEvent.click(screen.getByRole("button", { name: "更多导出选项" }));
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "更多导出选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "仅导出字幕" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "导出完成" }),
+    ).toBeInTheDocument();
+    expect(chooseExportDestination).toHaveBeenCalledWith(
+      "/tmp/voice.wav",
+      "subtitleOnly",
+      undefined,
+    );
+    expect(exportEditedMedia).toHaveBeenCalledWith(
+      "/tmp/voice.wav",
+      "/tmp/voice-cut.srt",
+      "audio",
+      "subtitleOnly",
+      expect.any(Array),
+      expect.any(Function),
+    );
+    expect(screen.getByText("字幕文件")).toBeInTheDocument();
+    expect(screen.queryByText("音频文件")).not.toBeInTheDocument();
+  });
+
+  it("detects the video audio container before exporting audio only", async () => {
+    vi.mocked(getModelStatus).mockResolvedValue({
+      state: "ready",
+      directory: "/models/sense-voice",
+      issues: [],
+    });
+    vi.mocked(chooseMediaFile).mockResolvedValue("/tmp/talking.mov");
+    vi.mocked(transcribeMedia).mockResolvedValue({
+      sourcePath: "/tmp/talking.mov",
+      sourceName: "talking.mov",
+      mediaKind: "video",
+      segments: [
+        {
+          id: 1,
+          startSample: 0,
+          endSample: 16_000,
+          sampleRate: 16_000,
+          originalText: "视频内容",
+          editedText: "视频内容",
+          retained: true,
+        },
+      ],
+    });
+    vi.mocked(getAudioExportExtension).mockResolvedValue("m4a");
+    vi.mocked(chooseExportDestination).mockResolvedValue(
+      "/tmp/talking-cut-audio.m4a",
+    );
+    vi.mocked(exportEditedMedia).mockResolvedValue({
+      files: [{ kind: "audio", path: "/tmp/talking-cut-audio.m4a" }],
+    });
+
+    render(<App />);
+    const upload = await screen.findByRole("button", {
+      name: /点击上传或拖拽文件到此处/,
+    });
+    await waitFor(() => expect(upload).toBeEnabled());
+    fireEvent.click(upload);
+    await screen.findByRole("heading", { name: "保留需要的口播内容" });
+
+    fireEvent.click(screen.getByRole("button", { name: "更多导出选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "仅导出音频" }));
+
+    await screen.findByRole("heading", { name: "导出完成" });
+    expect(getAudioExportExtension).toHaveBeenCalledWith("/tmp/talking.mov");
+    expect(chooseExportDestination).toHaveBeenCalledWith(
+      "/tmp/talking.mov",
+      "audioOnly",
+      "m4a",
+    );
+    expect(exportEditedMedia).toHaveBeenCalledWith(
+      "/tmp/talking.mov",
+      "/tmp/talking-cut-audio.m4a",
+      "video",
+      "audioOnly",
+      expect.any(Array),
       expect.any(Function),
     );
   });

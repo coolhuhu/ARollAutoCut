@@ -4,7 +4,9 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
 use arollcut_lib::domain::transcript::TranscriptSegment;
-use arollcut_lib::services::exporter::{export_edited_media, ExportRequest};
+use arollcut_lib::services::exporter::{
+    audio_export_extension, export_edited_media, ExportFileKind, ExportMode, ExportRequest,
+};
 use arollcut_lib::services::transcription::MediaKind;
 use tempfile::tempdir;
 
@@ -36,11 +38,16 @@ fn exports_retained_audio_and_recalculates_srt_timestamps() {
 
     let result = export_edited_media(
         ExportRequest {
-            ffmpeg: &repository_path("src-tauri/binaries/ffmpeg-aarch64-apple-darwin"),
-            ffprobe: &repository_path("src-tauri/binaries/ffprobe-aarch64-apple-darwin"),
+            ffmpeg: Some(&repository_path(
+                "src-tauri/binaries/ffmpeg-aarch64-apple-darwin",
+            )),
+            ffprobe: Some(&repository_path(
+                "src-tauri/binaries/ffprobe-aarch64-apple-darwin",
+            )),
             source: &repository_path("models/vad-test.wav"),
             destination: &output_path,
             media_kind: MediaKind::Audio,
+            mode: ExportMode::AudioWithSubtitle,
             segments: &segments,
         },
         &cancelled,
@@ -48,9 +55,17 @@ fn exports_retained_audio_and_recalculates_srt_timestamps() {
     )
     .expect("export edited audio");
 
-    assert!(result.media_path.metadata().expect("output metadata").len() > 44);
+    assert!(
+        result.files[0]
+            .path
+            .metadata()
+            .expect("output metadata")
+            .len()
+            > 44
+    );
+    assert_eq!(result.files[0].kind, ExportFileKind::Audio);
     assert_eq!(
-        fs::read_to_string(result.subtitle_path).expect("subtitle"),
+        fs::read_to_string(&result.files[1].path).expect("subtitle"),
         "1\n00:00:00,000 --> 00:00:01,000\n保留  第一句\n\n\
          2\n00:00:01,000 --> 00:00:02,000\n\
          一二三四五六七八九十甲乙丙丁\n\
@@ -94,11 +109,12 @@ fn preserves_primary_video_properties_when_exporting_a_mov() {
     ];
     export_edited_media(
         ExportRequest {
-            ffmpeg: &ffmpeg,
-            ffprobe: &ffprobe,
+            ffmpeg: Some(&ffmpeg),
+            ffprobe: Some(&ffprobe),
             source: &source,
             destination: &output,
             media_kind: MediaKind::Video,
+            mode: ExportMode::VideoWithSubtitle,
             segments: &segments,
         },
         &AtomicBool::new(false),
@@ -127,6 +143,79 @@ fn preserves_primary_video_properties_when_exporting_a_mov() {
         fs::read_to_string(output.with_extension("srt")).expect("subtitle"),
         "1\n00:00:00,000 --> 00:00:00,750\n保留第一段\n\n\
          2\n00:00:00,750 --> 00:00:01,500\n保留第二段\n\n"
+    );
+
+    let audio_output = directory.path().join("source-cut-audio.wav");
+    assert_eq!(
+        audio_export_extension(&ffprobe, &source).expect("audio extension"),
+        "wav"
+    );
+    let audio_result = export_edited_media(
+        ExportRequest {
+            ffmpeg: Some(&ffmpeg),
+            ffprobe: Some(&ffprobe),
+            source: &source,
+            destination: &audio_output,
+            media_kind: MediaKind::Video,
+            mode: ExportMode::AudioOnly,
+            segments: &segments,
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .expect("export video audio only");
+
+    assert_eq!(
+        audio_result.files,
+        vec![arollcut_lib::services::exporter::ExportedFile {
+            kind: ExportFileKind::Audio,
+            path: audio_output.clone(),
+        }]
+    );
+    let audio_probe = probe_streams(&ffprobe, &audio_output);
+    assert!(audio_probe["streams"]
+        .as_array()
+        .expect("audio streams")
+        .iter()
+        .all(|stream| stream["codec_type"] != "video"));
+    assert!(!audio_output.with_extension("srt").exists());
+}
+
+#[test]
+fn exports_only_subtitles_with_original_audio_timestamps() {
+    let directory = tempdir().expect("output directory");
+    let source = directory.path().join("source.wav");
+    let output = directory.path().join("source-cut.srt");
+    fs::write(&source, b"test source").expect("source");
+    let mut deleted = TranscriptSegment::new(2, 16_000, 32_000, 16_000, "删除".to_owned());
+    deleted.delete();
+    let segments = vec![
+        TranscriptSegment::new(1, 0, 16_000, 16_000, "第一句".to_owned()),
+        deleted,
+        TranscriptSegment::new(3, 32_000, 48_000, 16_000, "第三句".to_owned()),
+    ];
+
+    let result = export_edited_media(
+        ExportRequest {
+            ffmpeg: None,
+            ffprobe: None,
+            source: &source,
+            destination: &output,
+            media_kind: MediaKind::Audio,
+            mode: ExportMode::SubtitleOnly,
+            segments: &segments,
+        },
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .expect("export subtitle only");
+
+    assert_eq!(result.files.len(), 1);
+    assert_eq!(result.files[0].kind, ExportFileKind::Subtitle);
+    assert_eq!(
+        fs::read_to_string(&result.files[0].path).expect("subtitle"),
+        "1\n00:00:00,000 --> 00:00:01,000\n第一句\n\n\
+         2\n00:00:02,000 --> 00:00:03,000\n第三句\n\n"
     );
 }
 

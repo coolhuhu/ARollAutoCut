@@ -8,11 +8,14 @@ import {
   chooseMediaFile,
   exportEditedMedia,
   formatMediaTimestamp,
+  getAudioExportExtension,
   listenForAppClose,
   listenForMediaDrop,
   shouldProtectAppClose,
   transcribeMedia,
   type ExportProgress,
+  type ExportFileKind,
+  type ExportMode,
   type ExportResult,
   type TranscriptSegment,
   type TranscriptionProgress,
@@ -67,6 +70,17 @@ const INITIAL_PROGRESS: TranscriptionProgress = {
   message: "正在准备识别任务",
 };
 
+function exportFileLabel(kind: ExportFileKind): string {
+  switch (kind) {
+    case "video":
+      return "视频文件";
+    case "audio":
+      return "音频文件";
+    case "subtitle":
+      return "字幕文件";
+  }
+}
+
 export default function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [modelError, setModelError] = useState("");
@@ -86,9 +100,11 @@ export default function App() {
     null,
   );
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [showExportMenu, setShowExportMenu] = useState(false);
   const [modelDownloadProgress, setModelDownloadProgress] =
     useState<ModelDownloadProgress | null>(null);
   const closeProtectionRef = useRef(false);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
   closeProtectionRef.current = shouldProtectAppClose({
     isDownloadingModel: modelDownloadProgress !== null,
     isProcessing: phase === "processing",
@@ -100,6 +116,34 @@ export default function App() {
   useEffect(() => {
     void refreshModelStatus();
   }, []);
+
+  useEffect(() => {
+    if (!showExportMenu) {
+      return;
+    }
+
+    function closeOnOutsideClick(event: MouseEvent) {
+      if (
+        event.target instanceof Node &&
+        !exportMenuRef.current?.contains(event.target)
+      ) {
+        setShowExportMenu(false);
+      }
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setShowExportMenu(false);
+      }
+    }
+
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showExportMenu]);
 
   useEffect(() => {
     let disposed = false;
@@ -239,6 +283,7 @@ export default function App() {
     setSegments([]);
     setEditingId(null);
     setEditingError("");
+    setShowExportMenu(false);
     setPhase("home");
     await selectMedia();
   }
@@ -292,24 +337,36 @@ export default function App() {
     }
   }
 
-  async function startExport() {
+  async function startExport(mode: ExportMode) {
     if (!result) {
       return;
     }
-    const destination = await chooseExportDestination(result.sourcePath);
-    if (!destination) {
-      return;
-    }
 
+    setShowExportMenu(false);
     setOperationError("");
-    setExportResult(null);
-    setExportProgress({ percent: 0, message: "正在准备导出" });
     try {
+      const audioExtension =
+        result.mediaKind === "video" &&
+        (mode === "audioWithSubtitle" || mode === "audioOnly")
+          ? await getAudioExportExtension(result.sourcePath)
+          : undefined;
+      const destination = await chooseExportDestination(
+        result.sourcePath,
+        mode,
+        audioExtension,
+      );
+      if (!destination) {
+        return;
+      }
+
+      setExportResult(null);
+      setExportProgress({ percent: 0, message: "正在准备导出" });
       setExportResult(
         await exportEditedMedia(
           result.sourcePath,
           destination,
           result.mediaKind,
+          mode,
           segments,
           setExportProgress,
         ),
@@ -335,6 +392,7 @@ export default function App() {
     setExportResult(null);
     setResult(null);
     setSegments([]);
+    setShowExportMenu(false);
     setPhase("home");
   }
 
@@ -377,6 +435,10 @@ export default function App() {
 
   if (phase === "editor" && result) {
     const retainedCount = segments.filter((segment) => segment.retained).length;
+    const defaultExportMode: ExportMode =
+      result.mediaKind === "video"
+        ? "videoWithSubtitle"
+        : "audioWithSubtitle";
     return (
       <main className="editor-shell">
         <header className="app-header">
@@ -392,14 +454,59 @@ export default function App() {
             >
               重新上传
             </button>
-            <button
-              className="primary-button"
-              type="button"
-              disabled={retainedCount === 0}
-              onClick={() => void startExport()}
-            >
-              导出{result.mediaKind === "video" ? "视频" : "音频"}
-            </button>
+            <div className="export-menu" ref={exportMenuRef}>
+              <div className="split-export-button">
+                <button
+                  className="primary-button export-main-button"
+                  type="button"
+                  disabled={retainedCount === 0}
+                  onClick={() => void startExport(defaultExportMode)}
+                >
+                  导出{result.mediaKind === "video" ? "视频" : "音频"}
+                </button>
+                <button
+                  className="primary-button export-menu-button"
+                  type="button"
+                  aria-label="更多导出选项"
+                  aria-haspopup="menu"
+                  aria-expanded={showExportMenu}
+                  disabled={retainedCount === 0}
+                  onClick={() => setShowExportMenu((visible) => !visible)}
+                >
+                  <span aria-hidden="true">⌄</span>
+                </button>
+              </div>
+              {showExportMenu && (
+                <div className="export-options" role="menu">
+                  {result.mediaKind === "video" ? (
+                    <>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void startExport("audioWithSubtitle")}
+                      >
+                        导出音频和字幕
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => void startExport("audioOnly")}
+                      >
+                        仅导出音频
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => void startExport("subtitleOnly")}
+                    >
+                      仅导出字幕
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </header>
 
@@ -537,7 +644,7 @@ export default function App() {
               aria-label="正在导出"
             >
               <span className="processing-mark">OUT</span>
-              <h2>正在导出媒体</h2>
+              <h2>正在导出文件</h2>
               <p>{exportProgress.message}</p>
               <div
                 className="progress-track"
@@ -571,10 +678,14 @@ export default function App() {
             >
               <span className="success-mark">完成</span>
               <h2 id="export-complete-title">导出完成</h2>
-              <p>媒体文件</p>
-              <code>{exportResult.mediaPath}</code>
-              <p>字幕文件</p>
-              <code>{exportResult.subtitlePath}</code>
+              <div className="exported-files">
+                {exportResult.files.map((file) => (
+                  <div key={`${file.kind}-${file.path}`}>
+                    <p>{exportFileLabel(file.kind)}</p>
+                    <code>{file.path}</code>
+                  </div>
+                ))}
+              </div>
               <button
                 className="primary-button"
                 type="button"

@@ -513,6 +513,15 @@ h1 {
   text-align: left;
 }
 
+.exported-files {
+  display: grid;
+  gap: 14px;
+}
+
+.exported-files p {
+  margin-top: 0;
+}
+
 .export-complete-dialog button {
   margin-top: 26px;
 }
@@ -557,6 +566,63 @@ h1 {
   border-radius: 9px;
   cursor: pointer;
   font-weight: 650;
+}
+
+.export-menu {
+  position: relative;
+}
+
+.split-export-button {
+  display: flex;
+}
+
+.header-actions .export-main-button {
+  border-radius: 9px 0 0 9px;
+}
+
+.header-actions .export-menu-button {
+  width: 38px;
+  padding: 9px 0;
+  border-left: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 0 9px 9px 0;
+}
+
+.export-menu-button span {
+  display: block;
+  font-size: 16px;
+  line-height: 1;
+  transform: translateY(-1px);
+}
+
+.export-options {
+  width: max-content;
+  min-width: 168px;
+  padding: 6px;
+  display: grid;
+  gap: 2px;
+  border: 1px solid #dce3ed;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 14px 34px rgba(29, 41, 61, 0.16);
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 10;
+}
+
+.header-actions .export-options button {
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 7px;
+  color: #344158;
+  background: transparent;
+  text-align: left;
+}
+
+.header-actions .export-options button:hover,
+.header-actions .export-options button:focus-visible {
+  background: #f0f5ff;
 }
 
 .editor-content {

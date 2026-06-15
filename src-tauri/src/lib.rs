@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use app_info::AppInfo;
 use domain::transcript::TranscriptSegment;
 use services::exporter::{
-    export_edited_media as run_export, ExportProgress, ExportRequest, ExportResult,
+    audio_export_extension, export_edited_media as run_export, ExportMode, ExportProgress,
+    ExportRequest, ExportResult,
 };
 use services::model_manager::{
     configured_model_directory, default_model_directory, download_model as run_model_download,
@@ -146,12 +147,19 @@ async fn export_edited_media(
     source_path: String,
     destination_path: String,
     media_kind: MediaKind,
+    mode: ExportMode,
     segments: Vec<TranscriptSegment>,
 ) -> Result<ExportResult, String> {
-    let ffmpeg =
-        bundled_binary(&app, "ffmpeg").ok_or_else(|| "FFmpeg sidecar 尚未安装".to_owned())?;
-    let ffprobe =
-        bundled_binary(&app, "ffprobe").ok_or_else(|| "FFprobe sidecar 尚未安装".to_owned())?;
+    let ffmpeg = if mode.requires_media_tools() {
+        Some(bundled_binary(&app, "ffmpeg").ok_or_else(|| "FFmpeg sidecar 尚未安装".to_owned())?)
+    } else {
+        None
+    };
+    let ffprobe = if mode.requires_media_tools() {
+        Some(bundled_binary(&app, "ffprobe").ok_or_else(|| "FFprobe sidecar 尚未安装".to_owned())?)
+    } else {
+        None
+    };
     let cancellation = state.begin().map_err(str::to_owned)?;
     let source = PathBuf::from(source_path);
     let destination = PathBuf::from(destination_path);
@@ -161,11 +169,12 @@ async fn export_edited_media(
     let joined = tauri::async_runtime::spawn_blocking(move || {
         run_export(
             ExportRequest {
-                ffmpeg: &ffmpeg,
-                ffprobe: &ffprobe,
+                ffmpeg: ffmpeg.as_deref(),
+                ffprobe: ffprobe.as_deref(),
                 source: &source,
                 destination: &destination,
                 media_kind,
+                mode,
                 segments: &segments,
             },
             &task_cancellation,
@@ -179,6 +188,16 @@ async fn export_edited_media(
 
     state.finish(&cancellation);
     joined.map_err(|error| format!("导出任务异常终止：{error}"))?
+}
+
+#[tauri::command]
+fn get_audio_export_extension(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<String, String> {
+    let ffprobe =
+        bundled_binary(&app, "ffprobe").ok_or_else(|| "FFprobe sidecar 尚未安装".to_owned())?;
+    audio_export_extension(&ffprobe, Path::new(&source_path)).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -276,6 +295,7 @@ pub fn run() {
             cancel_model_download,
             transcribe_media,
             cancel_transcription,
+            get_audio_export_extension,
             export_edited_media,
             cancel_export
         ])
