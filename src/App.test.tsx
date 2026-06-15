@@ -13,6 +13,7 @@ import {
   chooseMediaFile,
   exportEditedMedia,
   getAudioExportExtension,
+  listenForAppClose,
   transcribeMedia,
 } from "./media-api";
 import { downloadModel, getModelStatus } from "./model-api";
@@ -312,6 +313,43 @@ describe("App", () => {
     );
     expect(screen.getByText("音频文件")).toBeInTheDocument();
     expect(screen.getByText("字幕文件")).toBeInTheDocument();
+
+    const closeProtection = vi.mocked(listenForAppClose).mock.calls[0]?.[0];
+    expect(closeProtection?.()).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "继续编辑" }));
+    expect(
+      screen.queryByRole("heading", { name: "导出完成" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "保留需要的口播内容" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("修正后的第一句 补充的第二行")).toBeInTheDocument();
+
+    vi.mocked(chooseExportDestination).mockResolvedValue(
+      "/tmp/vad-test-cut.srt",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "更多导出选项" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "仅导出字幕" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "导出完成" }),
+    ).toBeInTheDocument();
+    expect(exportEditedMedia).toHaveBeenLastCalledWith(
+      "/tmp/vad-test.wav",
+      "/tmp/vad-test-cut.srt",
+      "audio",
+      "subtitleOnly",
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 1,
+          editedText: "修正后的第一句 补充的第二行",
+          retained: true,
+        }),
+      ]),
+      expect.any(Function),
+    );
+    expect(exportEditedMedia).toHaveBeenCalledTimes(2);
   });
 
   it("exports only subtitles from the audio export menu", async () => {

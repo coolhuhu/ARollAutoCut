@@ -62,7 +62,6 @@ describe("shouldProtectAppClose", () => {
       isProcessing: false,
       isExporting: false,
       isEditing: false,
-      exportCompleted: false,
     };
 
     expect(
@@ -73,14 +72,13 @@ describe("shouldProtectAppClose", () => {
     expect(shouldProtectAppClose({ ...idle, isEditing: true })).toBe(true);
   });
 
-  it("does not protect an idle or completed session", () => {
+  it("does not protect an idle session but always protects the editor", () => {
     expect(
       shouldProtectAppClose({
         isDownloadingModel: false,
         isProcessing: false,
         isExporting: false,
         isEditing: false,
-        exportCompleted: false,
       }),
     ).toBe(false);
     expect(
@@ -89,9 +87,8 @@ describe("shouldProtectAppClose", () => {
         isProcessing: false,
         isExporting: false,
         isEditing: true,
-        exportCompleted: true,
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 });
 

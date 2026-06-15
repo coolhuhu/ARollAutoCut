@@ -110,7 +110,6 @@ export default function App() {
     isProcessing: phase === "processing",
     isExporting: exportProgress !== null,
     isEditing: phase === "editor",
-    exportCompleted: exportResult !== null,
   });
 
   useEffect(() => {
@@ -388,12 +387,8 @@ export default function App() {
     await cancelExport();
   }
 
-  function finishEditing() {
+  function continueEditing() {
     setExportResult(null);
-    setResult(null);
-    setSegments([]);
-    setShowExportMenu(false);
-    setPhase("home");
   }
 
   const modelReady = modelStatus?.state === "ready";
@@ -689,9 +684,9 @@ export default function App() {
               <button
                 className="primary-button"
                 type="button"
-                onClick={finishEditing}
+                onClick={continueEditing}
               >
-                完成本次编辑
+                继续编辑
               </button>
             </section>
           </div>

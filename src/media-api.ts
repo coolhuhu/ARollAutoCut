@@ -248,19 +248,17 @@ export function shouldProtectAppClose({
   isProcessing,
   isExporting,
   isEditing,
-  exportCompleted,
 }: {
   isDownloadingModel: boolean;
   isProcessing: boolean;
   isExporting: boolean;
   isEditing: boolean;
-  exportCompleted: boolean;
 }): boolean {
   return (
     isDownloadingModel ||
     isProcessing ||
     isExporting ||
-    (isEditing && !exportCompleted)
+    isEditing
   );
 }
 
