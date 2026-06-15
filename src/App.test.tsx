@@ -243,8 +243,34 @@ describe("App", () => {
     );
 
     expect(
-      screen.getByText("修正后的第一句 补充的第二行"),
+      within(editingCard!).getByRole("alert"),
+    ).toHaveTextContent("字幕内容不能换行编辑，请删除换行后再保存。");
+    expect(multilineInput).toHaveValue("修正后的第一句\n补充的第二行");
+    expect(
+      within(editingCard!).getByRole("button", { name: "保存" }),
     ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(editingCard!).getByRole("button", { name: "取消" }),
+    );
+    expect(screen.getByText("第一句")).toBeInTheDocument();
+    expect(within(editingCard!).queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(
+      within(editingCard!).getByRole("button", { name: "修正" }),
+    );
+    const correctedInput = screen.getByRole("textbox", {
+      name: "编辑第 1 条字幕",
+    });
+    fireEvent.change(correctedInput, {
+      target: { value: "修正后的第一句 补充的第二行" },
+    });
+    expect(within(editingCard!).queryByRole("alert")).not.toBeInTheDocument();
+    fireEvent.click(
+      within(editingCard!).getByRole("button", { name: "保存" }),
+    );
+
+    expect(screen.getByText("修正后的第一句 补充的第二行")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "修正" })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: "删除" })).toHaveLength(2);
 
@@ -272,7 +298,7 @@ describe("App", () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: 1,
-          editedText: "修正后的第一句\n补充的第二行",
+          editedText: "修正后的第一句 补充的第二行",
           retained: true,
         }),
       ]),

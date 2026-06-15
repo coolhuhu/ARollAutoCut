@@ -23,9 +23,15 @@ fn exports_retained_audio_and_recalculates_srt_timestamps() {
     let mut deleted = TranscriptSegment::new(2, 16_000, 32_000, 16_000, "删除这一句".to_owned());
     deleted.delete();
     let segments = vec![
-        TranscriptSegment::new(1, 0, 16_000, 16_000, "保留第一句".to_owned()),
+        TranscriptSegment::new(1, 0, 16_000, 16_000, "保留，第一句。".to_owned()),
         deleted,
-        TranscriptSegment::new(3, 32_000, 48_000, 16_000, "保留第三句".to_owned()),
+        TranscriptSegment::new(
+            3,
+            32_000,
+            48_000,
+            16_000,
+            "一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯辰巳午。".to_owned(),
+        ),
     ];
 
     let result = export_edited_media(
@@ -45,8 +51,10 @@ fn exports_retained_audio_and_recalculates_srt_timestamps() {
     assert!(result.media_path.metadata().expect("output metadata").len() > 44);
     assert_eq!(
         fs::read_to_string(result.subtitle_path).expect("subtitle"),
-        "1\n00:00:00,000 --> 00:00:01,000\n保留第一句\n\n\
-         2\n00:00:01,000 --> 00:00:02,000\n保留第三句\n\n"
+        "1\n00:00:00,000 --> 00:00:01,000\n保留  第一句\n\n\
+         2\n00:00:01,000 --> 00:00:02,000\n\
+         一二三四五六七八九十甲乙丙丁\n\
+         戊己庚辛壬癸子丑寅卯辰巳午\n\n"
     );
 }
 

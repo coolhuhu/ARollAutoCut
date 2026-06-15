@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub enum TranscriptEditError {
     EmptyText,
     DeletedSegment,
+    LineBreak,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -53,6 +54,9 @@ impl TranscriptSegment {
         if text.is_empty() {
             return Err(TranscriptEditError::EmptyText);
         }
+        if text.contains(['\n', '\r']) {
+            return Err(TranscriptEditError::LineBreak);
+        }
         self.edited_text = text.to_owned();
         Ok(())
     }
@@ -97,6 +101,21 @@ mod tests {
         assert_eq!(
             segment.edit_text(" \n "),
             Err(TranscriptEditError::EmptyText)
+        );
+        assert_eq!(segment.edited_text, "原文");
+    }
+
+    #[test]
+    fn rejects_line_breaks() {
+        let mut segment = TranscriptSegment::new(1, 0, 100, 16_000, "原文".into());
+
+        assert_eq!(
+            segment.edit_text("第一行\n第二行"),
+            Err(TranscriptEditError::LineBreak)
+        );
+        assert_eq!(
+            segment.edit_text("第一行\r第二行"),
+            Err(TranscriptEditError::LineBreak)
         );
         assert_eq!(segment.edited_text, "原文");
     }

@@ -600,6 +600,12 @@ h1 {
   margin: 0 0 18px;
 }
 
+.edit-error {
+  margin: 8px 0 0;
+  color: #9b372d;
+  font-size: 13px;
+}
+
 .subtitle-list {
   display: grid;
   gap: 12px;

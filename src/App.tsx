@@ -81,6 +81,7 @@ export default function App() {
   const [operationError, setOperationError] = useState("");
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editingText, setEditingText] = useState("");
+  const [editingError, setEditingError] = useState("");
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(
     null,
   );
@@ -237,6 +238,7 @@ export default function App() {
     setResult(null);
     setSegments([]);
     setEditingId(null);
+    setEditingError("");
     setPhase("home");
     await selectMedia();
   }
@@ -244,11 +246,16 @@ export default function App() {
   function beginEditing(segment: TranscriptSegment) {
     setEditingId(segment.id);
     setEditingText(segment.editedText);
+    setEditingError("");
   }
 
   function saveEditing() {
     const text = editingText.trim();
     if (editingId === null || text.length === 0) {
+      return;
+    }
+    if (/[\r\n]/u.test(text)) {
+      setEditingError("字幕内容不能换行编辑，请删除换行后再保存。");
       return;
     }
     setSegments((current) =>
@@ -258,11 +265,13 @@ export default function App() {
     );
     setEditingId(null);
     setEditingText("");
+    setEditingError("");
   }
 
   function cancelEditing() {
     setEditingId(null);
     setEditingText("");
+    setEditingError("");
   }
 
   function resizeEditingArea(element: HTMLTextAreaElement) {
@@ -279,6 +288,7 @@ export default function App() {
     if (!retained && editingId === id) {
       setEditingId(null);
       setEditingText("");
+      setEditingError("");
     }
   }
 
@@ -449,7 +459,11 @@ export default function App() {
                           }}
                           value={editingText}
                           onChange={(event) => {
-                            setEditingText(event.currentTarget.value);
+                            const value = event.currentTarget.value;
+                            setEditingText(value);
+                            if (!/[\r\n]/u.test(value)) {
+                              setEditingError("");
+                            }
                             resizeEditingArea(event.currentTarget);
                           }}
                           onKeyDown={(event) => {
@@ -459,6 +473,11 @@ export default function App() {
                           }}
                           autoFocus
                         />
+                        {editingError && (
+                          <p className="edit-error" role="alert">
+                            {editingError}
+                          </p>
+                        )}
                       </div>
                     ) : (
                       <p>{segment.editedText}</p>
