@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -8,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::transcript::TranscriptSegment;
 
 use super::media_tools::{extract_speech_wave, MediaToolError};
+use super::model_manager::VadSettings;
 use super::speech::{SpeechEngine, SpeechError, SpeechModelPaths};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -23,6 +25,7 @@ pub struct TranscriptionResult {
     pub source_path: PathBuf,
     pub source_name: String,
     pub media_kind: MediaKind,
+    pub preview_audio_path: PathBuf,
     pub segments: Vec<TranscriptSegment>,
 }
 
@@ -41,8 +44,8 @@ pub enum TranscriptionError {
     MissingFfmpeg,
     NoSpeech,
     Media(MediaToolError),
+    PreviewAudio(std::io::Error),
     Speech(SpeechError),
-    TemporaryDirectory(std::io::Error),
 }
 
 impl fmt::Display for TranscriptionError {
@@ -55,8 +58,8 @@ impl fmt::Display for TranscriptionError {
             Self::MissingFfmpeg => write!(formatter, "此文件需要 FFmpeg sidecar，但当前尚未安装"),
             Self::NoSpeech => write!(formatter, "没有检测到有效语音片段"),
             Self::Media(error) => error.fmt(formatter),
+            Self::PreviewAudio(error) => write!(formatter, "无法准备预览音频：{error}"),
             Self::Speech(error) => error.fmt(formatter),
-            Self::TemporaryDirectory(error) => write!(formatter, "无法创建临时目录：{error}"),
         }
     }
 }
@@ -89,6 +92,8 @@ pub fn classify_media(path: &Path) -> Result<MediaKind, TranscriptionError> {
 pub fn transcribe_media(
     source: &Path,
     model_paths: SpeechModelPaths,
+    vad_settings: VadSettings,
+    preview_audio: &Path,
     ffmpeg: Option<&Path>,
     cancelled: &AtomicBool,
     mut on_progress: impl FnMut(TranscriptionProgress),
@@ -97,7 +102,8 @@ pub fn transcribe_media(
     check_cancelled(cancelled)?;
     on_progress(progress("preparing", 8, "正在加载语音识别模型"));
 
-    let engine = SpeechEngine::create(model_paths).map_err(TranscriptionError::Speech)?;
+    let engine =
+        SpeechEngine::create(model_paths, vad_settings).map_err(TranscriptionError::Speech)?;
     let is_cancelled = || cancelled.load(Ordering::Relaxed);
 
     on_progress(progress("vad", 35, "正在检测有效语音片段"));
@@ -107,7 +113,8 @@ pub fn transcribe_media(
         .is_some_and(|value| value.eq_ignore_ascii_case("wav"));
 
     let segments = if direct_wave {
-        match recognize_wave(&engine, source, &is_cancelled, &mut on_progress) {
+        fs::copy(source, preview_audio).map_err(TranscriptionError::PreviewAudio)?;
+        match recognize_wave(&engine, preview_audio, &is_cancelled, &mut on_progress) {
             Ok(segments) => segments,
             Err(SpeechError::InvalidWave(_) | SpeechError::UnsupportedSampleRate(_))
                 if ffmpeg.is_some() =>
@@ -115,6 +122,7 @@ pub fn transcribe_media(
                 transcribe_prepared_wave(
                     &engine,
                     source,
+                    preview_audio,
                     ffmpeg.expect("checked above"),
                     &is_cancelled,
                     &mut on_progress,
@@ -126,6 +134,7 @@ pub fn transcribe_media(
         transcribe_prepared_wave(
             &engine,
             source,
+            preview_audio,
             ffmpeg.ok_or(TranscriptionError::MissingFfmpeg)?,
             &is_cancelled,
             &mut on_progress,
@@ -146,6 +155,7 @@ pub fn transcribe_media(
             .unwrap_or("未命名媒体")
             .to_owned(),
         media_kind,
+        preview_audio_path: preview_audio.into(),
         segments,
     })
 }
@@ -153,14 +163,13 @@ pub fn transcribe_media(
 fn transcribe_prepared_wave(
     engine: &SpeechEngine,
     source: &Path,
+    wave_path: &Path,
     ffmpeg: &Path,
     is_cancelled: &dyn Fn() -> bool,
     on_progress: &mut dyn FnMut(TranscriptionProgress),
 ) -> Result<Vec<TranscriptSegment>, TranscriptionError> {
     on_progress(progress("preparing", 18, "正在提取并转换音轨"));
-    let directory = tempfile::tempdir().map_err(TranscriptionError::TemporaryDirectory)?;
-    let wave_path = directory.path().join("speech.wav");
-    extract_speech_wave(ffmpeg, source, &wave_path, is_cancelled)
+    extract_speech_wave(ffmpeg, source, wave_path, is_cancelled)
         .map_err(TranscriptionError::Media)?;
     on_progress(progress("vad", 35, "正在检测有效语音片段"));
     recognize_wave(engine, &wave_path, is_cancelled, on_progress)

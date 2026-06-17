@@ -16,13 +16,22 @@ import {
   listenForAppClose,
   transcribeMedia,
 } from "./media-api";
-import { downloadModel, getModelStatus } from "./model-api";
+import {
+  downloadModel,
+  getModelStatus,
+  getVadSettings,
+  resetVadSettings,
+  saveVadSettings,
+} from "./model-api";
 
 vi.mock("./model-api", () => ({
   getModelStatus: vi.fn(),
   chooseModelDirectory: vi.fn(),
   downloadModel: vi.fn(),
   cancelModelDownload: vi.fn(),
+  getVadSettings: vi.fn(),
+  saveVadSettings: vi.fn(),
+  resetVadSettings: vi.fn(),
   formatDownloadBytes: (downloadedBytes: number, totalBytes: number | null) =>
     totalBytes === null
       ? `${downloadedBytes} B`
@@ -56,6 +65,17 @@ describe("App", () => {
       directory: "/App Data/models/sense-voice",
       issues: ["缺少文件：model.int8.onnx"],
     });
+    vi.mocked(getVadSettings).mockResolvedValue({
+      minSilenceDuration: 0.5,
+      minSpeechDuration: 0.25,
+      maxSpeechDuration: 20,
+    });
+    vi.mocked(saveVadSettings).mockImplementation(async (settings) => settings);
+    vi.mocked(resetVadSettings).mockResolvedValue({
+      minSilenceDuration: 0.5,
+      minSpeechDuration: 0.25,
+      maxSpeechDuration: 20,
+    });
   });
 
   it("renders the initial upload experience", async () => {
@@ -83,6 +103,88 @@ describe("App", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("/App Data/models/sense-voice")).toBeInTheDocument();
     expect(screen.getByText("缺少文件：model.int8.onnx")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "VAD 设置" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("最短静音时长 min_silence_duration"),
+    ).toHaveValue(0.5);
+    expect(
+      screen.getByLabelText("最短语音时长 min_speech_duration"),
+    ).toHaveValue(0.25);
+    expect(
+      screen.getByLabelText("最长语音时长 max_speech_duration"),
+    ).toHaveValue(20);
+  });
+
+  it("saves and resets VAD settings in the model settings dialog", async () => {
+    vi.mocked(getModelStatus).mockResolvedValue({
+      state: "ready",
+      directory: "/models/sense-voice",
+      issues: [],
+    });
+    vi.mocked(getVadSettings).mockResolvedValue({
+      minSilenceDuration: 0.8,
+      minSpeechDuration: 0.4,
+      maxSpeechDuration: 30,
+    });
+
+    render(<App />);
+    await screen.findByText("SenseVoice 模型可用");
+    fireEvent.click(screen.getByRole("button", { name: "模型设置" }));
+    const minSilence = await screen.findByLabelText(
+      "最短静音时长 min_silence_duration",
+    );
+    const minSpeech = screen.getByLabelText(
+      "最短语音时长 min_speech_duration",
+    );
+    const maxSpeech = screen.getByLabelText(
+      "最长语音时长 max_speech_duration",
+    );
+
+    expect(minSilence).toHaveValue(0.8);
+    fireEvent.change(minSilence, { target: { value: "1.2" } });
+    fireEvent.change(minSpeech, { target: { value: "0.6" } });
+    fireEvent.change(maxSpeech, { target: { value: "45" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存 VAD 设置" }));
+
+    await waitFor(() =>
+      expect(saveVadSettings).toHaveBeenCalledWith({
+        minSilenceDuration: 1.2,
+        minSpeechDuration: 0.6,
+        maxSpeechDuration: 45,
+      }),
+    );
+    expect(
+      screen.getByText("VAD 设置已保存，将在下一次识别时生效。"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "恢复默认值" }));
+
+    await waitFor(() => expect(resetVadSettings).toHaveBeenCalledOnce());
+    expect(minSilence).toHaveValue(0.5);
+    expect(minSpeech).toHaveValue(0.25);
+    expect(maxSpeech).toHaveValue(20);
+    expect(
+      screen.getByText("已恢复默认 VAD 设置，将在下一次识别时生效。"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a validation error for invalid VAD settings", async () => {
+    render(<App />);
+    await screen.findByText("SenseVoice 模型尚未配置");
+    fireEvent.click(screen.getByRole("button", { name: "模型设置" }));
+    const minSilence = await screen.findByLabelText(
+      "最短静音时长 min_silence_duration",
+    );
+
+    fireEvent.change(minSilence, { target: { value: "0.01" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存 VAD 设置" }));
+
+    expect(
+      screen.getByText(/最短静音时长 min_silence_duration 必须在 0.1 到 5 秒之间/),
+    ).toBeInTheDocument();
+    expect(saveVadSettings).not.toHaveBeenCalled();
   });
 
   it("enables upload when the model is ready", async () => {
@@ -147,6 +249,7 @@ describe("App", () => {
         sourcePath: "/tmp/vad-test.wav",
         sourceName: "vad-test.wav",
         mediaKind: "audio",
+        previewAudioPath: "/tmp/vad-test.wav",
         segments: [
           {
             id: 1,
@@ -187,6 +290,28 @@ describe("App", () => {
       screen.queryByText(/导出时将严格使用 VAD 时间边界/),
     ).not.toBeInTheDocument();
     expect(screen.getByText("00:00:01,500 → 00:00:02,500")).toBeInTheDocument();
+    const playAudio = vi
+      .spyOn(window.HTMLMediaElement.prototype, "play")
+      .mockResolvedValue(undefined);
+    const pauseAudio = vi
+      .spyOn(window.HTMLMediaElement.prototype, "pause")
+      .mockImplementation(() => {});
+
+    fireEvent.click(screen.getByRole("button", { name: "播放第 1 条字幕" }));
+    expect(playAudio).toHaveBeenCalledOnce();
+    expect(
+      screen.getByRole("button", { name: "暂停第 1 条字幕" }),
+    ).toBeInTheDocument();
+    const previewAudio = screen.getByTestId(
+      "preview-audio",
+    ) as HTMLAudioElement;
+    const firstSegmentProgress = screen.getByLabelText("第 1 条字幕播放进度");
+    fireEvent.change(firstSegmentProgress, { target: { value: "0.5" } });
+    expect(previewAudio.currentTime).toBeCloseTo(0.5);
+    fireEvent.click(screen.getByRole("button", { name: "暂停第 1 条字幕" }));
+    expect(pauseAudio).toHaveBeenCalled();
+    playAudio.mockRestore();
+    pauseAudio.mockRestore();
 
     fireEvent.click(screen.getAllByRole("button", { name: "删除" })[0]);
     expect(screen.getByText(/已保留/)).toHaveTextContent("1 / 2 段");
@@ -352,6 +477,65 @@ describe("App", () => {
     expect(exportEditedMedia).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps the current edit when reupload file selection is cancelled", async () => {
+    vi.mocked(getModelStatus).mockResolvedValue({
+      state: "ready",
+      directory: "/models/sense-voice",
+      issues: [],
+    });
+    vi.mocked(chooseMediaFile).mockResolvedValueOnce("/tmp/vad-test.wav");
+    vi.mocked(transcribeMedia).mockResolvedValue({
+      sourcePath: "/tmp/vad-test.wav",
+      sourceName: "vad-test.wav",
+      mediaKind: "audio",
+      previewAudioPath: "/tmp/vad-test.wav",
+      segments: [
+        {
+          id: 1,
+          startSample: 0,
+          endSample: 16_000,
+          sampleRate: 16_000,
+          originalText: "第一句",
+          editedText: "第一句",
+          retained: true,
+        },
+        {
+          id: 2,
+          startSample: 16_000,
+          endSample: 32_000,
+          sampleRate: 16_000,
+          originalText: "第二句",
+          editedText: "第二句",
+          retained: true,
+        },
+      ],
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+    const upload = await screen.findByRole("button", {
+      name: /点击上传或拖拽文件到此处/,
+    });
+    await waitFor(() => expect(upload).toBeEnabled());
+    fireEvent.click(upload);
+    await screen.findByRole("heading", { name: "保留需要的口播内容" });
+
+    fireEvent.click(screen.getAllByRole("button", { name: "删除" })[0]);
+    expect(screen.getByText(/已保留/)).toHaveTextContent("1 / 2 段");
+    vi.mocked(chooseMediaFile).mockResolvedValueOnce(null);
+
+    fireEvent.click(screen.getByRole("button", { name: "重新上传" }));
+
+    await waitFor(() => expect(chooseMediaFile).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByRole("heading", { name: "保留需要的口播内容" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("第一句")).toBeInTheDocument();
+    expect(screen.getByText("第二句")).toBeInTheDocument();
+    expect(screen.getByText(/已保留/)).toHaveTextContent("1 / 2 段");
+    expect(transcribeMedia).toHaveBeenCalledTimes(1);
+  });
+
   it("exports only subtitles from the audio export menu", async () => {
     vi.mocked(getModelStatus).mockResolvedValue({
       state: "ready",
@@ -363,6 +547,7 @@ describe("App", () => {
       sourcePath: "/tmp/voice.wav",
       sourceName: "voice.wav",
       mediaKind: "audio",
+      previewAudioPath: "/tmp/voice.wav",
       segments: [
         {
           id: 1,
@@ -427,6 +612,7 @@ describe("App", () => {
       sourcePath: "/tmp/talking.mov",
       sourceName: "talking.mov",
       mediaKind: "video",
+      previewAudioPath: "/tmp/talking-preview.wav",
       segments: [
         {
           id: 1,

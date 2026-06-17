@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+use arollcut_lib::services::model_manager::VadSettings;
 use arollcut_lib::services::speech::{SpeechEngine, SpeechModelPaths};
 use arollcut_lib::services::transcription::{transcribe_media, MediaKind};
 
@@ -13,11 +14,16 @@ fn repository_path(relative: &str) -> PathBuf {
 #[test]
 #[ignore = "loads local Silero and SenseVoice models"]
 fn transcribes_the_vad_test_audio_with_rust() {
-    let engine = SpeechEngine::create(SpeechModelPaths {
-        vad_model: repository_path("src-tauri/resources/silero_vad.onnx"),
-        sense_voice_model: repository_path("models/sherpa-onnx-sense-voice-small/model.int8.onnx"),
-        tokens: repository_path("models/sherpa-onnx-sense-voice-small/tokens.txt"),
-    })
+    let engine = SpeechEngine::create(
+        SpeechModelPaths {
+            vad_model: repository_path("src-tauri/resources/silero_vad.onnx"),
+            sense_voice_model: repository_path(
+                "models/sherpa-onnx-sense-voice-small/model.int8.onnx",
+            ),
+            tokens: repository_path("models/sherpa-onnx-sense-voice-small/tokens.txt"),
+        },
+        VadSettings::default(),
+    )
     .expect("create speech engine");
 
     let segments = engine
@@ -44,7 +50,9 @@ fn transcribes_the_vad_test_audio_with_rust() {
 #[test]
 #[ignore = "loads local Silero and SenseVoice models"]
 fn runs_the_complete_wav_import_pipeline() {
+    let directory = tempfile::tempdir().expect("preview directory");
     let source = repository_path("models/vad-test.wav");
+    let preview_audio = directory.path().join("preview.wav");
     let cancelled = AtomicBool::new(false);
     let mut progress = Vec::new();
 
@@ -57,6 +65,8 @@ fn runs_the_complete_wav_import_pipeline() {
             ),
             tokens: repository_path("models/sherpa-onnx-sense-voice-small/tokens.txt"),
         },
+        VadSettings::default(),
+        &preview_audio,
         None,
         &cancelled,
         |update| progress.push(update),
@@ -65,6 +75,8 @@ fn runs_the_complete_wav_import_pipeline() {
 
     assert_eq!(result.media_kind, MediaKind::Audio);
     assert_eq!(result.source_name, "vad-test.wav");
+    assert_eq!(result.preview_audio_path, preview_audio);
+    assert!(result.preview_audio_path.is_file());
     assert_eq!(result.segments.len(), 3);
     assert_eq!(progress.last().expect("final progress").percent, 100);
     assert!(progress.iter().any(|update| update.stage == "recognizing"));

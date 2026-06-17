@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
@@ -22,6 +22,7 @@ export interface TranscriptionResult {
   sourcePath: string;
   sourceName: string;
   mediaKind: "audio" | "video";
+  previewAudioPath: string;
   segments: TranscriptSegment[];
 }
 
@@ -275,6 +276,10 @@ export function formatMediaTimestamp(
     .map((value) => value.toString().padStart(2, "0"))
     .join(":")
     .concat(`,${milliseconds.toString().padStart(3, "0")}`);
+}
+
+export function localMediaUrl(path: string): string {
+  return isTauriRuntime() ? convertFileSrc(path) : path;
 }
 
 export function defaultExportName(

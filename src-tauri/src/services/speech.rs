@@ -10,6 +10,8 @@ use sherpa_onnx::{
 use crate::domain::subtitle_split::split_recognition;
 use crate::domain::transcript::TranscriptSegment;
 
+use super::model_manager::VadSettings;
+
 const SAMPLE_RATE: i32 = 16_000;
 const VAD_WINDOW_SIZE: usize = 512;
 
@@ -77,12 +79,16 @@ struct DetectedSpeech {
 
 pub struct SpeechEngine {
     paths: SpeechModelPaths,
+    vad_settings: VadSettings,
     recognizer: OfflineRecognizer,
 }
 
 impl SpeechEngine {
-    pub fn create(paths: SpeechModelPaths) -> Result<Self, SpeechError> {
+    pub fn create(paths: SpeechModelPaths, vad_settings: VadSettings) -> Result<Self, SpeechError> {
         paths.validate()?;
+        let vad_settings = vad_settings
+            .validate()
+            .map_err(|_| SpeechError::VadInitialization)?;
 
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
@@ -97,7 +103,11 @@ impl SpeechEngine {
         let recognizer =
             OfflineRecognizer::create(&config).ok_or(SpeechError::RecognizerInitialization)?;
 
-        Ok(Self { paths, recognizer })
+        Ok(Self {
+            paths,
+            vad_settings,
+            recognizer,
+        })
     }
 
     pub fn transcribe_wave(&self, path: &Path) -> Result<Vec<TranscriptSegment>, SpeechError> {
@@ -138,7 +148,7 @@ impl SpeechEngine {
         if is_cancelled() {
             return Err(SpeechError::Cancelled);
         }
-        let detected = detect_speech(samples, &self.paths.vad_model)?;
+        let detected = detect_speech(samples, &self.paths.vad_model, self.vad_settings)?;
         let total = detected.len();
         let mut segments = Vec::new();
         let mut next_segment_id = 1;
@@ -179,22 +189,12 @@ impl SpeechEngine {
     }
 }
 
-fn detect_speech(samples: &[f32], model_path: &Path) -> Result<Vec<DetectedSpeech>, SpeechError> {
-    let config = VadModelConfig {
-        silero_vad: SileroVadModelConfig {
-            model: Some(path_string(model_path)),
-            threshold: 0.5,
-            min_silence_duration: 0.5,
-            min_speech_duration: 0.25,
-            window_size: VAD_WINDOW_SIZE as i32,
-            max_speech_duration: 20.0,
-        },
-        sample_rate: SAMPLE_RATE,
-        num_threads: 1,
-        provider: Some("cpu".into()),
-        debug: false,
-        ..Default::default()
-    };
+fn detect_speech(
+    samples: &[f32],
+    model_path: &Path,
+    vad_settings: VadSettings,
+) -> Result<Vec<DetectedSpeech>, SpeechError> {
+    let config = build_vad_config(model_path, vad_settings);
     let detector =
         VoiceActivityDetector::create(&config, 60.0).ok_or(SpeechError::VadInitialization)?;
     let mut output = Vec::new();
@@ -207,6 +207,24 @@ fn detect_speech(samples: &[f32], model_path: &Path) -> Result<Vec<DetectedSpeec
     drain_segments(&detector, &mut output);
 
     Ok(output)
+}
+
+fn build_vad_config(model_path: &Path, vad_settings: VadSettings) -> VadModelConfig {
+    VadModelConfig {
+        silero_vad: SileroVadModelConfig {
+            model: Some(path_string(model_path)),
+            threshold: 0.5,
+            min_silence_duration: vad_settings.min_silence_duration,
+            min_speech_duration: vad_settings.min_speech_duration,
+            window_size: VAD_WINDOW_SIZE as i32,
+            max_speech_duration: vad_settings.max_speech_duration,
+        },
+        sample_rate: SAMPLE_RATE,
+        num_threads: 1,
+        provider: Some("cpu".into()),
+        debug: false,
+        ..Default::default()
+    }
 }
 
 fn drain_segments(detector: &VoiceActivityDetector, output: &mut Vec<DetectedSpeech>) {
@@ -227,7 +245,8 @@ fn path_string(path: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{SpeechError, SpeechModelPaths};
+    use super::{build_vad_config, SpeechError, SpeechModelPaths};
+    use crate::services::model_manager::VadSettings;
 
     #[test]
     fn reports_the_first_missing_model_file() {
@@ -246,5 +265,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn builds_vad_config_from_user_settings() {
+        let settings = VadSettings {
+            min_silence_duration: 0.8,
+            min_speech_duration: 0.4,
+            max_speech_duration: 42.0,
+        };
+
+        let config = build_vad_config(PathBuf::from("/models/vad.onnx").as_path(), settings);
+
+        assert_eq!(config.silero_vad.min_silence_duration, 0.8);
+        assert_eq!(config.silero_vad.min_speech_duration, 0.4);
+        assert_eq!(config.silero_vad.max_speech_duration, 42.0);
     }
 }

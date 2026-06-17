@@ -61,6 +61,57 @@ pub struct ModelDownloadProgress {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VadSettings {
+    pub min_silence_duration: f32,
+    pub min_speech_duration: f32,
+    pub max_speech_duration: f32,
+}
+
+impl Default for VadSettings {
+    fn default() -> Self {
+        Self {
+            min_silence_duration: 0.5,
+            min_speech_duration: 0.25,
+            max_speech_duration: 20.0,
+        }
+    }
+}
+
+impl VadSettings {
+    pub fn validate(self) -> Result<Self, String> {
+        validate_range(
+            "min_silence_duration",
+            "最短静音时长",
+            self.min_silence_duration,
+            0.1,
+            5.0,
+        )?;
+        validate_range(
+            "min_speech_duration",
+            "最短语音时长",
+            self.min_speech_duration,
+            0.05,
+            5.0,
+        )?;
+        validate_range(
+            "max_speech_duration",
+            "最长语音时长",
+            self.max_speech_duration,
+            5.0,
+            120.0,
+        )?;
+        if self.max_speech_duration <= self.min_speech_duration {
+            return Err(
+                "最长语音时长 max_speech_duration 必须大于最短语音时长 min_speech_duration"
+                    .to_owned(),
+            );
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug)]
 pub enum ModelDownloadError {
     Request(reqwest::Error),
@@ -88,6 +139,7 @@ impl std::error::Error for ModelDownloadError {}
 #[serde(rename_all = "camelCase")]
 struct ModelSettings {
     model_directory: Option<PathBuf>,
+    vad_settings: Option<VadSettings>,
 }
 
 pub fn default_model_directory(app_data_dir: &Path) -> PathBuf {
@@ -98,31 +150,42 @@ pub fn configured_model_directory(
     app_data_dir: &Path,
     app_config_dir: &Path,
 ) -> io::Result<PathBuf> {
-    let settings_path = settings_path(app_config_dir);
-    if !settings_path.is_file() {
-        return Ok(default_model_directory(app_data_dir));
-    }
-
-    let settings: ModelSettings = serde_json::from_slice(&fs::read(settings_path)?)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let settings = read_settings(app_config_dir)?;
     Ok(settings
         .model_directory
         .unwrap_or_else(|| default_model_directory(app_data_dir)))
 }
 
 pub fn save_model_directory(app_config_dir: &Path, directory: &Path) -> io::Result<()> {
-    fs::create_dir_all(app_config_dir)?;
-    let settings_path = settings_path(app_config_dir);
-    let temporary_path = settings_path.with_extension("json.tmp");
-    let settings = ModelSettings {
-        model_directory: Some(directory.to_path_buf()),
-    };
-    let contents = serde_json::to_vec_pretty(&settings)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-
-    fs::write(&temporary_path, contents)?;
-    fs::rename(temporary_path, settings_path)?;
+    let mut settings = read_settings(app_config_dir)?;
+    settings.model_directory = Some(directory.to_path_buf());
+    write_settings(app_config_dir, &settings)?;
     Ok(())
+}
+
+pub fn configured_vad_settings(app_config_dir: &Path) -> io::Result<VadSettings> {
+    Ok(read_settings(app_config_dir)?
+        .vad_settings
+        .unwrap_or_default()
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?)
+}
+
+pub fn save_vad_settings(
+    app_config_dir: &Path,
+    vad_settings: VadSettings,
+) -> io::Result<VadSettings> {
+    let vad_settings = vad_settings
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut settings = read_settings(app_config_dir)?;
+    settings.vad_settings = Some(vad_settings);
+    write_settings(app_config_dir, &settings)?;
+    Ok(vad_settings)
+}
+
+pub fn reset_vad_settings(app_config_dir: &Path) -> io::Result<VadSettings> {
+    save_vad_settings(app_config_dir, VadSettings::default())
 }
 
 pub fn inspect_model_directory(directory: &Path) -> io::Result<ModelStatus> {
@@ -403,6 +466,45 @@ fn settings_path(app_config_dir: &Path) -> PathBuf {
     app_config_dir.join("settings.json")
 }
 
+fn read_settings(app_config_dir: &Path) -> io::Result<ModelSettings> {
+    let path = settings_path(app_config_dir);
+    if !path.is_file() {
+        return Ok(ModelSettings::default());
+    }
+    serde_json::from_slice(&fs::read(path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn write_settings(app_config_dir: &Path, settings: &ModelSettings) -> io::Result<()> {
+    fs::create_dir_all(app_config_dir)?;
+    let path = settings_path(app_config_dir);
+    let temporary_path = path.with_extension("json.tmp");
+    let contents = serde_json::to_vec_pretty(settings)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    fs::write(&temporary_path, contents)?;
+    fs::rename(temporary_path, path)?;
+    Ok(())
+}
+
+fn validate_range(
+    key: &str,
+    label: &str,
+    value: f32,
+    minimum: f32,
+    maximum: f32,
+) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{label} {key} 必须是有效数字"));
+    }
+    if value < minimum || value > maximum {
+        return Err(format!(
+            "{label} {key} 必须在 {minimum} 到 {maximum} 秒之间"
+        ));
+    }
+    Ok(())
+}
+
 fn inspect_with_manifest(
     directory: &Path,
     manifest: &[ModelFileSpec],
@@ -479,10 +581,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        configured_model_directory, copy_download_stream, default_model_directory, download_model,
-        extract_required_files, inspect_with_manifest, map_download_io_error, save_model_directory,
-        ModelDownloadError, ModelFileSpec, ModelState, MODEL_ARCHIVE_NAME, MODEL_DIRECTORY_NAME,
-        MODEL_DOWNLOAD_URL,
+        configured_model_directory, configured_vad_settings, copy_download_stream,
+        default_model_directory, download_model, extract_required_files, inspect_with_manifest,
+        map_download_io_error, reset_vad_settings, save_model_directory, save_vad_settings,
+        ModelDownloadError, ModelFileSpec, ModelState, VadSettings, MODEL_ARCHIVE_NAME,
+        MODEL_DIRECTORY_NAME, MODEL_DOWNLOAD_URL,
     };
 
     #[test]
@@ -557,6 +660,115 @@ mod tests {
         assert_eq!(
             configured_model_directory(&app_data, &app_config).expect("configured directory"),
             selected
+        );
+    }
+
+    #[test]
+    fn uses_default_vad_settings_when_no_setting_exists() {
+        let directory = tempdir().expect("temp directory");
+
+        assert_eq!(
+            configured_vad_settings(directory.path()).expect("vad settings"),
+            VadSettings::default()
+        );
+    }
+
+    #[test]
+    fn persists_custom_vad_settings() {
+        let directory = tempdir().expect("temp directory");
+        let settings = VadSettings {
+            min_silence_duration: 0.8,
+            min_speech_duration: 0.4,
+            max_speech_duration: 30.0,
+        };
+
+        save_vad_settings(directory.path(), settings).expect("save vad settings");
+
+        assert_eq!(
+            configured_vad_settings(directory.path()).expect("vad settings"),
+            settings
+        );
+    }
+
+    #[test]
+    fn resets_vad_settings_to_defaults() {
+        let directory = tempdir().expect("temp directory");
+        save_vad_settings(
+            directory.path(),
+            VadSettings {
+                min_silence_duration: 0.8,
+                min_speech_duration: 0.4,
+                max_speech_duration: 30.0,
+            },
+        )
+        .expect("save custom vad settings");
+
+        assert_eq!(
+            reset_vad_settings(directory.path()).expect("reset vad settings"),
+            VadSettings::default()
+        );
+        assert_eq!(
+            configured_vad_settings(directory.path()).expect("vad settings"),
+            VadSettings::default()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_vad_settings() {
+        let directory = tempdir().expect("temp directory");
+
+        let error = save_vad_settings(
+            directory.path(),
+            VadSettings {
+                min_silence_duration: 0.01,
+                min_speech_duration: 0.25,
+                max_speech_duration: 20.0,
+            },
+        )
+        .expect_err("invalid vad settings");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("min_silence_duration"));
+    }
+
+    #[test]
+    fn model_directory_and_vad_settings_do_not_overwrite_each_other() {
+        let directory = tempdir().expect("temp directory");
+        let app_data = directory.path().join("data");
+        let app_config = directory.path().join("config");
+        let selected = directory.path().join("selected-model");
+        let vad_settings = VadSettings {
+            min_silence_duration: 0.7,
+            min_speech_duration: 0.35,
+            max_speech_duration: 25.0,
+        };
+
+        save_vad_settings(&app_config, vad_settings).expect("save vad settings");
+        save_model_directory(&app_config, &selected).expect("save model directory");
+
+        assert_eq!(
+            configured_vad_settings(&app_config).expect("vad settings"),
+            vad_settings
+        );
+        assert_eq!(
+            configured_model_directory(&app_data, &app_config).expect("model directory"),
+            selected
+        );
+
+        let updated_vad_settings = VadSettings {
+            min_silence_duration: 1.0,
+            min_speech_duration: 0.5,
+            max_speech_duration: 60.0,
+        };
+        save_vad_settings(&app_config, updated_vad_settings).expect("save updated vad settings");
+
+        assert_eq!(
+            configured_model_directory(&app_data, &app_config).expect("model directory"),
+            selected
+        );
+        assert_eq!(
+            configured_vad_settings(&app_config).expect("vad settings"),
+            updated_vad_settings
         );
     }
 

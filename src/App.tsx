@@ -11,6 +11,7 @@ import {
   getAudioExportExtension,
   listenForAppClose,
   listenForMediaDrop,
+  localMediaUrl,
   shouldProtectAppClose,
   transcribeMedia,
   type ExportProgress,
@@ -27,8 +28,12 @@ import {
   downloadModel,
   formatDownloadBytes,
   getModelStatus,
+  getVadSettings,
+  resetVadSettings,
+  saveVadSettings,
   type ModelDownloadProgress,
   type ModelStatus,
+  type VadSettings,
 } from "./model-api";
 
 function UploadIcon() {
@@ -70,6 +75,27 @@ const INITIAL_PROGRESS: TranscriptionProgress = {
   message: "正在准备识别任务",
 };
 
+type VadSettingsFields = Record<keyof VadSettings, string>;
+
+type PlaybackRange = {
+  segmentId: number;
+  startSeconds: number;
+  endSeconds: number;
+  durationSeconds: number;
+};
+
+type PlaybackState = {
+  segmentId: number | null;
+  currentSeconds: number;
+  isPlaying: boolean;
+};
+
+const DEFAULT_VAD_FIELDS: VadSettingsFields = {
+  minSilenceDuration: "0.5",
+  minSpeechDuration: "0.25",
+  maxSpeechDuration: "20",
+};
+
 function exportFileLabel(kind: ExportFileKind): string {
   switch (kind) {
     case "video":
@@ -79,6 +105,90 @@ function exportFileLabel(kind: ExportFileKind): string {
     case "subtitle":
       return "字幕文件";
   }
+}
+
+function vadSettingsToFields(settings: VadSettings): VadSettingsFields {
+  return {
+    minSilenceDuration: String(settings.minSilenceDuration),
+    minSpeechDuration: String(settings.minSpeechDuration),
+    maxSpeechDuration: String(settings.maxSpeechDuration),
+  };
+}
+
+function parseVadSettings(fields: VadSettingsFields): VadSettings {
+  const settings = {
+    minSilenceDuration: parseVadNumber(fields.minSilenceDuration),
+    minSpeechDuration: parseVadNumber(fields.minSpeechDuration),
+    maxSpeechDuration: parseVadNumber(fields.maxSpeechDuration),
+  };
+  validateVadRange(
+    "最短静音时长 min_silence_duration",
+    settings.minSilenceDuration,
+    0.1,
+    5,
+  );
+  validateVadRange(
+    "最短语音时长 min_speech_duration",
+    settings.minSpeechDuration,
+    0.05,
+    5,
+  );
+  validateVadRange(
+    "最长语音时长 max_speech_duration",
+    settings.maxSpeechDuration,
+    5,
+    120,
+  );
+  if (settings.maxSpeechDuration <= settings.minSpeechDuration) {
+    throw new Error(
+      "最长语音时长 max_speech_duration 必须大于最短语音时长 min_speech_duration",
+    );
+  }
+  return settings;
+}
+
+function parseVadNumber(value: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error("VAD 设置必须填写有效数字");
+  }
+  return parsed;
+}
+
+function validateVadRange(
+  label: string,
+  value: number,
+  minimum: number,
+  maximum: number,
+) {
+  if (value < minimum || value > maximum) {
+    throw new Error(`${label} 必须在 ${minimum} 到 ${maximum} 秒之间`);
+  }
+}
+
+function segmentStartSeconds(segment: TranscriptSegment): number {
+  return segment.startSample / segment.sampleRate;
+}
+
+function segmentEndSeconds(segment: TranscriptSegment): number {
+  return segment.endSample / segment.sampleRate;
+}
+
+function segmentDurationSeconds(segment: TranscriptSegment): number {
+  return segmentEndSeconds(segment) - segmentStartSeconds(segment);
+}
+
+function formatPlaybackClock(seconds: number): string {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainingSeconds = safeSeconds % 60;
+  return `${minutes.toString().padStart(2, "0")}:${remainingSeconds
+    .toString()
+    .padStart(2, "0")}`;
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.min(maximum, Math.max(minimum, value));
 }
 
 export default function App() {
@@ -103,8 +213,21 @@ export default function App() {
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [modelDownloadProgress, setModelDownloadProgress] =
     useState<ModelDownloadProgress | null>(null);
+  const [vadFields, setVadFields] =
+    useState<VadSettingsFields>(DEFAULT_VAD_FIELDS);
+  const [vadError, setVadError] = useState("");
+  const [vadMessage, setVadMessage] = useState("");
+  const [vadLoading, setVadLoading] = useState(false);
   const closeProtectionRef = useRef(false);
   const exportMenuRef = useRef<HTMLDivElement>(null);
+  const previewAudioRef = useRef<HTMLAudioElement>(null);
+  const playbackRangeRef = useRef<PlaybackRange | null>(null);
+  const [playback, setPlayback] = useState<PlaybackState>({
+    segmentId: null,
+    currentSeconds: 0,
+    isPlaying: false,
+  });
+  const [playbackError, setPlaybackError] = useState("");
   closeProtectionRef.current = shouldProtectAppClose({
     isDownloadingModel: modelDownloadProgress !== null,
     isProcessing: phase === "processing",
@@ -115,6 +238,12 @@ export default function App() {
   useEffect(() => {
     void refreshModelStatus();
   }, []);
+
+  useEffect(() => {
+    if (showModelSettings) {
+      void refreshVadSettings();
+    }
+  }, [showModelSettings]);
 
   useEffect(() => {
     if (!showExportMenu) {
@@ -198,6 +327,19 @@ export default function App() {
     }
   }
 
+  async function refreshVadSettings() {
+    try {
+      setVadLoading(true);
+      setVadError("");
+      setVadMessage("");
+      setVadFields(vadSettingsToFields(await getVadSettings()));
+    } catch (error) {
+      setVadError(String(error));
+    } finally {
+      setVadLoading(false);
+    }
+  }
+
   async function selectModelDirectory() {
     try {
       setModelError("");
@@ -238,6 +380,41 @@ export default function App() {
     await cancelModelDownload();
   }
 
+  function updateVadField(field: keyof VadSettings, value: string) {
+    setVadFields((current) => ({ ...current, [field]: value }));
+    setVadError("");
+    setVadMessage("");
+  }
+
+  async function persistVadSettings() {
+    try {
+      setVadLoading(true);
+      setVadError("");
+      setVadMessage("");
+      const settings = parseVadSettings(vadFields);
+      setVadFields(vadSettingsToFields(await saveVadSettings(settings)));
+      setVadMessage("VAD 设置已保存，将在下一次识别时生效。");
+    } catch (error) {
+      setVadError(String(error));
+    } finally {
+      setVadLoading(false);
+    }
+  }
+
+  async function restoreDefaultVadSettings() {
+    try {
+      setVadLoading(true);
+      setVadError("");
+      setVadMessage("");
+      setVadFields(vadSettingsToFields(await resetVadSettings()));
+      setVadMessage("已恢复默认 VAD 设置，将在下一次识别时生效。");
+    } catch (error) {
+      setVadError(String(error));
+    } finally {
+      setVadLoading(false);
+    }
+  }
+
   async function selectMedia() {
     const path = await chooseMediaFile();
     if (path) {
@@ -246,7 +423,9 @@ export default function App() {
   }
 
   async function startTranscription(path: string) {
+    stopPreviewPlayback();
     setOperationError("");
+    setPlaybackError("");
     setProgress(INITIAL_PROGRESS);
     setPhase("processing");
     try {
@@ -278,13 +457,17 @@ export default function App() {
     ) {
       return;
     }
-    setResult(null);
-    setSegments([]);
+    const path = await chooseMediaFile();
+    if (!path) {
+      return;
+    }
+    setExportResult(null);
     setEditingId(null);
+    setEditingText("");
     setEditingError("");
     setShowExportMenu(false);
-    setPhase("home");
-    await selectMedia();
+    stopPreviewPlayback();
+    await startTranscription(path);
   }
 
   function beginEditing(segment: TranscriptSegment) {
@@ -334,6 +517,113 @@ export default function App() {
       setEditingText("");
       setEditingError("");
     }
+  }
+
+  function stopPreviewPlayback() {
+    const audio = previewAudioRef.current;
+    if (audio) {
+      audio.pause();
+    }
+    playbackRangeRef.current = null;
+    setPlayback({ segmentId: null, currentSeconds: 0, isPlaying: false });
+  }
+
+  async function toggleSegmentPlayback(segment: TranscriptSegment) {
+    const audio = previewAudioRef.current;
+    if (!audio) {
+      setPlaybackError("无法播放该媒体片段，请确认原文件仍存在且格式可播放。");
+      return;
+    }
+    const durationSeconds = segmentDurationSeconds(segment);
+    const range = {
+      segmentId: segment.id,
+      startSeconds: segmentStartSeconds(segment),
+      endSeconds: segmentEndSeconds(segment),
+      durationSeconds,
+    };
+
+    if (playback.segmentId === segment.id && playback.isPlaying) {
+      audio.pause();
+      setPlayback((current) => ({ ...current, isPlaying: false }));
+      return;
+    }
+
+    playbackRangeRef.current = range;
+    const resumeSeconds =
+      playback.segmentId === segment.id && playback.currentSeconds < durationSeconds
+        ? playback.currentSeconds
+        : 0;
+    audio.currentTime = range.startSeconds + resumeSeconds;
+    setPlayback({
+      segmentId: segment.id,
+      currentSeconds: resumeSeconds,
+      isPlaying: true,
+    });
+    setPlaybackError("");
+
+    try {
+      await audio.play();
+    } catch {
+      setPlayback({
+        segmentId: segment.id,
+        currentSeconds: resumeSeconds,
+        isPlaying: false,
+      });
+      setPlaybackError("无法播放该媒体片段，请确认原文件仍存在且格式可播放。");
+    }
+  }
+
+  function seekSegmentPlayback(segment: TranscriptSegment, value: string) {
+    const audio = previewAudioRef.current;
+    const durationSeconds = segmentDurationSeconds(segment);
+    const currentSeconds = clamp(Number(value), 0, durationSeconds);
+    const range = {
+      segmentId: segment.id,
+      startSeconds: segmentStartSeconds(segment),
+      endSeconds: segmentEndSeconds(segment),
+      durationSeconds,
+    };
+    playbackRangeRef.current = range;
+    if (audio) {
+      audio.currentTime = range.startSeconds + currentSeconds;
+    }
+    setPlayback((current) => ({
+      segmentId: segment.id,
+      currentSeconds,
+      isPlaying: current.segmentId === segment.id && current.isPlaying,
+    }));
+  }
+
+  function updatePreviewPlaybackProgress() {
+    const audio = previewAudioRef.current;
+    const range = playbackRangeRef.current;
+    if (!audio || !range) {
+      return;
+    }
+    const currentSeconds = clamp(
+      audio.currentTime - range.startSeconds,
+      0,
+      range.durationSeconds,
+    );
+    if (audio.currentTime >= range.endSeconds) {
+      audio.pause();
+      audio.currentTime = range.endSeconds;
+      setPlayback({
+        segmentId: range.segmentId,
+        currentSeconds: range.durationSeconds,
+        isPlaying: false,
+      });
+      return;
+    }
+    setPlayback({
+      segmentId: range.segmentId,
+      currentSeconds,
+      isPlaying: !audio.paused,
+    });
+  }
+
+  function finishPreviewPlayback() {
+    setPlayback((current) => ({ ...current, isPlaying: false }));
   }
 
   async function startExport(mode: ExportMode) {
@@ -434,8 +724,21 @@ export default function App() {
       result.mediaKind === "video"
         ? "videoWithSubtitle"
         : "audioWithSubtitle";
+    const previewAudioUrl = localMediaUrl(result.previewAudioPath);
     return (
       <main className="editor-shell">
+        <audio
+          className="preview-audio"
+          data-testid="preview-audio"
+          ref={previewAudioRef}
+          src={previewAudioUrl}
+          preload="auto"
+          onEnded={finishPreviewPlayback}
+          onError={() =>
+            setPlaybackError("无法播放该媒体片段，请确认原文件仍存在且格式可播放。")
+          }
+          onTimeUpdate={updatePreviewPlaybackProgress}
+        />
         <header className="app-header">
           <div>
             <strong>{APP_NAME}</strong>
@@ -521,11 +824,21 @@ export default function App() {
               {operationError}
             </p>
           )}
+          {playbackError && (
+            <p className="operation-error editor-error" role="alert">
+              {playbackError}
+            </p>
+          )}
 
           <div className="subtitle-list">
             {segments.map((segment) => {
-              const duration =
-                (segment.endSample - segment.startSample) / segment.sampleRate;
+              const duration = segmentDurationSeconds(segment);
+              const isCurrentPlayback = playback.segmentId === segment.id;
+              const playbackSeconds = isCurrentPlayback
+                ? clamp(playback.currentSeconds, 0, duration)
+                : 0;
+              const isSegmentPlaying =
+                isCurrentPlayback && playback.isPlaying;
               const isEditing = editingId === segment.id;
               return (
                 <article
@@ -546,7 +859,40 @@ export default function App() {
                           segment.sampleRate,
                         )}
                       </code>
-                      <span>{duration.toFixed(1)}s</span>
+                      <span className="segment-duration">
+                        {duration.toFixed(1)}s
+                      </span>
+                      <div className="segment-player">
+                        <button
+                          className="segment-play-button"
+                          type="button"
+                          aria-label={`${isSegmentPlaying ? "暂停" : "播放"}第 ${segment.id} 条字幕`}
+                          onClick={() => void toggleSegmentPlayback(segment)}
+                        >
+                          {isSegmentPlaying ? "暂停" : "播放"}
+                        </button>
+                        <span className="playback-time">
+                          {formatPlaybackClock(playbackSeconds)}
+                        </span>
+                        <input
+                          className="segment-playback-range"
+                          type="range"
+                          min={0}
+                          max={duration}
+                          step={0.05}
+                          value={playbackSeconds}
+                          aria-label={`第 ${segment.id} 条字幕播放进度`}
+                          onChange={(event) =>
+                            seekSegmentPlayback(
+                              segment,
+                              event.currentTarget.value,
+                            )
+                          }
+                        />
+                        <span className="playback-time">
+                          {formatPlaybackClock(duration)}
+                        </span>
+                      </div>
                     </div>
                     {isEditing ? (
                       <div className="edit-row">
@@ -791,29 +1137,32 @@ export default function App() {
               </button>
             </div>
 
-            <div className="model-status-row">
-              <span
-                className={`status-badge status-${modelStatus?.state ?? "checking"}`}
-              >
-                {modelStatus === null
-                  ? "检查中"
-                  : modelReady
-                    ? "可用"
-                    : modelStatus.state === "invalid"
-                      ? "校验失败"
-                      : "缺失"}
-              </span>
-              <code>{modelStatus?.directory ?? "正在读取模型目录..."}</code>
-            </div>
+            <section className="settings-section" aria-labelledby="sensevoice-settings-title">
+              <h3 id="sensevoice-settings-title">SenseVoice 模型</h3>
+              <div className="model-status-row">
+                <span
+                  className={`status-badge status-${modelStatus?.state ?? "checking"}`}
+                >
+                  {modelStatus === null
+                    ? "检查中"
+                    : modelReady
+                      ? "可用"
+                      : modelStatus.state === "invalid"
+                        ? "校验失败"
+                        : "缺失"}
+                </span>
+                <code>{modelStatus?.directory ?? "正在读取模型目录..."}</code>
+              </div>
 
-            {(modelStatus?.issues.length ?? 0) > 0 && (
-              <ul className="model-issues">
-                {modelStatus?.issues.map((issue) => (
-                  <li key={issue}>{issue}</li>
-                ))}
-              </ul>
-            )}
-            {modelError && <p className="dialog-error">{modelError}</p>}
+              {(modelStatus?.issues.length ?? 0) > 0 && (
+                <ul className="model-issues">
+                  {modelStatus?.issues.map((issue) => (
+                    <li key={issue}>{issue}</li>
+                  ))}
+                </ul>
+              )}
+              {modelError && <p className="dialog-error">{modelError}</p>}
+            </section>
 
             {modelDownloadProgress ? (
               <div className="model-download-panel" aria-live="polite">
@@ -850,7 +1199,7 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              <div className="dialog-actions">
+              <div className="dialog-actions model-actions">
                 <button
                   className="secondary-button"
                   type="button"
@@ -867,6 +1216,94 @@ export default function App() {
                 </button>
               </div>
             )}
+
+            <section className="settings-section" aria-labelledby="vad-settings-title">
+              <div>
+                <h3 id="vad-settings-title">VAD 设置</h3>
+                <p>
+                  设置会在下一次上传识别时生效；正在识别的任务不会动态变更。
+                </p>
+              </div>
+              <div className="vad-settings-grid">
+                <label>
+                  <span>最短静音时长 min_silence_duration</span>
+                  <input
+                    type="number"
+                    aria-label="最短静音时长 min_silence_duration"
+                    min="0.1"
+                    max="5"
+                    step="0.05"
+                    value={vadFields.minSilenceDuration}
+                    disabled={vadLoading || modelDownloadProgress !== null}
+                    onChange={(event) =>
+                      updateVadField(
+                        "minSilenceDuration",
+                        event.currentTarget.value,
+                      )
+                    }
+                  />
+                  <small>0.1 到 5.0 秒，默认 0.5 秒</small>
+                </label>
+                <label>
+                  <span>最短语音时长 min_speech_duration</span>
+                  <input
+                    type="number"
+                    aria-label="最短语音时长 min_speech_duration"
+                    min="0.05"
+                    max="5"
+                    step="0.05"
+                    value={vadFields.minSpeechDuration}
+                    disabled={vadLoading || modelDownloadProgress !== null}
+                    onChange={(event) =>
+                      updateVadField(
+                        "minSpeechDuration",
+                        event.currentTarget.value,
+                      )
+                    }
+                  />
+                  <small>0.05 到 5.0 秒，默认 0.25 秒</small>
+                </label>
+                <label>
+                  <span>最长语音时长 max_speech_duration</span>
+                  <input
+                    type="number"
+                    aria-label="最长语音时长 max_speech_duration"
+                    min="5"
+                    max="120"
+                    step="1"
+                    value={vadFields.maxSpeechDuration}
+                    disabled={vadLoading || modelDownloadProgress !== null}
+                    onChange={(event) =>
+                      updateVadField(
+                        "maxSpeechDuration",
+                        event.currentTarget.value,
+                      )
+                    }
+                  />
+                  <small>5.0 到 120.0 秒，默认 20.0 秒</small>
+                </label>
+              </div>
+              {vadError && <p className="dialog-error">{vadError}</p>}
+              {vadMessage && <p className="dialog-success">{vadMessage}</p>}
+              <div className="dialog-actions">
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={vadLoading || modelDownloadProgress !== null}
+                  onClick={() => void restoreDefaultVadSettings()}
+                >
+                  恢复默认值
+                </button>
+                <button
+                  className="primary-button"
+                  type="button"
+                  disabled={vadLoading || modelDownloadProgress !== null}
+                  onClick={() => void persistVadSettings()}
+                >
+                  保存 VAD 设置
+                </button>
+              </div>
+            </section>
           </section>
         </div>
       )}

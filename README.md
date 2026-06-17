@@ -173,6 +173,18 @@ tokens.txt
 
 Silero VAD 模型已经包含在 App 中，无需单独配置。
 
+### 配置 VAD
+
+在“模型设置”中可以调整 Silero VAD 的分段参数：
+
+```text
+min_silence_duration  默认 0.5 秒
+min_speech_duration   默认 0.25 秒
+max_speech_duration   默认 20.0 秒
+```
+
+如果未保存自定义设置，App 会继续使用默认值。保存后的 VAD 设置会在下一次上传并识别媒体时生效，已经开始的识别任务不会动态变更。
+
 ### 剪辑音视频
 
 1. 上传音频或视频文件，或将文件拖入 App。

@@ -18,6 +18,12 @@ export interface ModelDownloadProgress {
   message: string;
 }
 
+export interface VadSettings {
+  minSilenceDuration: number;
+  minSpeechDuration: number;
+  maxSpeechDuration: number;
+}
+
 function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
@@ -73,6 +79,37 @@ export async function cancelModelDownload(): Promise<boolean> {
     return false;
   }
   return invoke<boolean>("cancel_model_download");
+}
+
+export async function getVadSettings(): Promise<VadSettings> {
+  if (!isTauriRuntime()) {
+    return {
+      minSilenceDuration: 0.5,
+      minSpeechDuration: 0.25,
+      maxSpeechDuration: 20,
+    };
+  }
+  return invoke<VadSettings>("get_vad_settings");
+}
+
+export async function saveVadSettings(
+  settings: VadSettings,
+): Promise<VadSettings> {
+  if (!isTauriRuntime()) {
+    return settings;
+  }
+  return invoke<VadSettings>("save_vad_settings", { settings });
+}
+
+export async function resetVadSettings(): Promise<VadSettings> {
+  if (!isTauriRuntime()) {
+    return {
+      minSilenceDuration: 0.5,
+      minSpeechDuration: 0.25,
+      maxSpeechDuration: 20,
+    };
+  }
+  return invoke<VadSettings>("reset_vad_settings");
 }
 
 export function formatDownloadBytes(

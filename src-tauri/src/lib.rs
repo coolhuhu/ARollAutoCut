@@ -3,7 +3,9 @@ pub mod domain;
 pub mod services;
 mod task_state;
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use app_info::AppInfo;
 use domain::transcript::TranscriptSegment;
@@ -12,15 +14,18 @@ use services::exporter::{
     ExportRequest, ExportResult,
 };
 use services::model_manager::{
-    configured_model_directory, default_model_directory, download_model as run_model_download,
-    inspect_model_directory, save_model_directory, ModelDownloadProgress, ModelState, ModelStatus,
+    configured_model_directory, configured_vad_settings, default_model_directory,
+    download_model as run_model_download, inspect_model_directory,
+    reset_vad_settings as persist_default_vad_settings, save_model_directory,
+    save_vad_settings as persist_vad_settings, ModelDownloadProgress, ModelState, ModelStatus,
+    VadSettings,
 };
 use services::speech::SpeechModelPaths;
 use services::transcription::{
     transcribe_media as run_transcription, MediaKind, TranscriptionProgress, TranscriptionResult,
 };
 use task_state::ProcessingTaskState;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, RunEvent};
 
 #[tauri::command]
 fn get_app_info() -> AppInfo {
@@ -49,6 +54,26 @@ fn select_model_directory(app: tauri::AppHandle, directory: String) -> Result<Mo
     save_model_directory(&app_config_dir, &directory)
         .map_err(|error| format!("无法保存模型设置：{error}"))?;
     Ok(status)
+}
+
+#[tauri::command]
+fn get_vad_settings(app: tauri::AppHandle) -> Result<VadSettings, String> {
+    let (_, app_config_dir) = app_directories(&app)?;
+    configured_vad_settings(&app_config_dir).map_err(|error| format!("无法读取 VAD 设置：{error}"))
+}
+
+#[tauri::command]
+fn save_vad_settings(app: tauri::AppHandle, settings: VadSettings) -> Result<VadSettings, String> {
+    let (_, app_config_dir) = app_directories(&app)?;
+    persist_vad_settings(&app_config_dir, settings)
+        .map_err(|error| format!("无法保存 VAD 设置：{error}"))
+}
+
+#[tauri::command]
+fn reset_vad_settings(app: tauri::AppHandle) -> Result<VadSettings, String> {
+    let (_, app_config_dir) = app_directories(&app)?;
+    persist_default_vad_settings(&app_config_dir)
+        .map_err(|error| format!("无法恢复默认 VAD 设置：{error}"))
 }
 
 #[tauri::command]
@@ -93,6 +118,7 @@ async fn transcribe_media(
     path: String,
 ) -> Result<TranscriptionResult, String> {
     let app_data = app_directories(&app)?;
+    let preview_audio = preview_audio_path(&app)?;
     let vad_model = bundled_vad_model(&app)?;
     let ffmpeg = bundled_ffmpeg(&app);
     let cancellation = state.begin().map_err(str::to_owned)?;
@@ -117,16 +143,23 @@ async fn transcribe_media(
             sense_voice_model: model_directory.join("model.int8.onnx"),
             tokens: model_directory.join("tokens.txt"),
         };
+        let vad_settings = configured_vad_settings(&app_data.1)
+            .map_err(|error| format!("无法读取 VAD 设置：{error}"))?;
         run_transcription(
             &source,
             model_paths,
+            vad_settings,
+            &preview_audio,
             ffmpeg.as_deref(),
             &task_cancellation,
             |progress: TranscriptionProgress| {
                 let _ = event_app.emit("transcription-progress", progress);
             },
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| {
+            let _ = fs::remove_file(&preview_audio);
+            error.to_string()
+        })
     })
     .await;
 
@@ -238,6 +271,47 @@ fn bundled_vad_model(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .ok_or_else(|| "App 内置的 Silero VAD 模型不存在".to_owned())
 }
 
+fn preview_audio_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = preview_audio_directory(app)?;
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建预览音频目录：{error}"))?;
+    cleanup_preview_audio_directory(&directory);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    Ok(directory.join(format!("preview-{timestamp}.wav")))
+}
+
+fn preview_audio_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("无法获取 App Cache 目录：{error}"))?
+        .join("preview-audio"))
+}
+
+fn cleanup_preview_audio_cache(app: &tauri::AppHandle) {
+    if let Ok(directory) = preview_audio_directory(app) {
+        cleanup_preview_audio_directory(&directory);
+    }
+}
+
+fn cleanup_preview_audio_directory(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn bundled_binary(app: &tauri::AppHandle, binary: &str) -> Option<PathBuf> {
     let resource_dir = app.path().resource_dir().ok();
     let executable_dir = std::env::current_exe()
@@ -284,13 +358,16 @@ fn bundled_ffmpeg(app: &tauri::AppHandle) -> Option<PathBuf> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(ProcessingTaskState::default())
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             get_model_status,
             select_model_directory,
+            get_vad_settings,
+            save_vad_settings,
+            reset_vad_settings,
             download_model,
             cancel_model_download,
             transcribe_media,
@@ -299,13 +376,23 @@ pub fn run() {
             export_edited_media,
             cancel_export
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run ARollCut");
+        .build(tauri::generate_context!())
+        .expect("failed to build ARollCut");
+
+    app.run(|app_handle, event| {
+        if matches!(event, RunEvent::Exit) {
+            cleanup_preview_audio_cache(app_handle);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::bundled_binary_names;
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{bundled_binary_names, cleanup_preview_audio_directory};
 
     #[test]
     fn resolves_macos_apple_silicon_sidecar_names() {
@@ -321,5 +408,23 @@ mod tests {
             bundled_binary_names("ffprobe", "windows", "x86_64"),
             vec!["ffprobe.exe", "ffprobe-x86_64-pc-windows-msvc.exe"]
         );
+    }
+
+    #[test]
+    fn preview_audio_cleanup_removes_only_cached_wav_files() {
+        let directory = tempdir().expect("preview directory");
+        let cached_wave = directory.path().join("preview.wav");
+        let nested_wave = directory.path().join("nested").join("preview.wav");
+        let note = directory.path().join("note.txt");
+        fs::write(&cached_wave, b"wave").expect("write cached wave");
+        fs::create_dir_all(nested_wave.parent().expect("nested parent")).expect("nested dir");
+        fs::write(&nested_wave, b"nested wave").expect("write nested wave");
+        fs::write(&note, b"note").expect("write note");
+
+        cleanup_preview_audio_directory(directory.path());
+
+        assert!(!cached_wave.exists());
+        assert!(nested_wave.exists());
+        assert!(note.exists());
     }
 }
