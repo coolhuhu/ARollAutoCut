@@ -7,7 +7,6 @@ use sherpa_onnx::{
     VadModelConfig, VoiceActivityDetector, Wave,
 };
 
-use crate::domain::subtitle_split::split_recognition;
 use crate::domain::transcript::TranscriptSegment;
 
 use super::model_manager::VadSettings;
@@ -164,24 +163,14 @@ impl SpeechEngine {
                 .get_result()
                 .ok_or(SpeechError::MissingRecognitionResult)?;
             let end_sample = speech.start_sample + speech.samples.len() as u64;
-            let subtitles = split_recognition(
+            segments.push(TranscriptSegment::new(
+                next_segment_id,
                 speech.start_sample,
                 end_sample,
                 SAMPLE_RATE as u32,
-                &result.text,
-                &result.tokens,
-                result.timestamps.as_deref(),
-            );
-            for subtitle in subtitles {
-                segments.push(TranscriptSegment::new(
-                    next_segment_id,
-                    subtitle.start_sample,
-                    subtitle.end_sample,
-                    SAMPLE_RATE as u32,
-                    subtitle.text,
-                ));
-                next_segment_id += 1;
-            }
+                result.text.trim().to_owned(),
+            ));
+            next_segment_id += 1;
             on_segment(vad_index + 1, total);
         }
 

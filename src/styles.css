@@ -239,6 +239,10 @@ h1 {
   backdrop-filter: blur(4px);
 }
 
+.modal-backdrop-centered {
+  place-items: center;
+}
+
 .model-dialog {
   width: min(620px, 100%);
   max-height: calc(100vh - 48px);

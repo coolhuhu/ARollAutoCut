@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 
 use serde::Serialize;
 
@@ -119,16 +120,16 @@ pub fn build_export_timeline(
         );
     }
 
-    let mut cues = Vec::with_capacity(retained.len());
-    for (index, segment) in retained.into_iter().enumerate() {
+    let mut cues = Vec::new();
+    for segment in retained {
         let (range, preceding_duration) = containing_range(&ranges, segment);
-        cues.push(ExportCue {
-            index: index as u32 + 1,
-            start_sample: preceding_duration + segment.start_sample - range.start_sample,
-            end_sample: preceding_duration + segment.end_sample - range.start_sample,
+        push_split_cues(
+            &mut cues,
+            preceding_duration + segment.start_sample - range.start_sample,
+            preceding_duration + segment.end_sample - range.start_sample,
             sample_rate,
-            text: segment.edited_text.clone(),
-        });
+            &segment.edited_text,
+        );
     }
 
     Ok(ExportTimeline {
@@ -149,20 +150,18 @@ pub fn build_original_subtitle_cues(
     retained.sort_by_key(|segment| (segment.start_sample, segment.end_sample, segment.id));
 
     let sample_rate = retained[0].sample_rate;
-    retained
-        .into_iter()
-        .enumerate()
-        .map(|(index, segment)| {
-            validate_segment(segment, sample_rate)?;
-            Ok(ExportCue {
-                index: index as u32 + 1,
-                start_sample: segment.start_sample,
-                end_sample: segment.end_sample,
-                sample_rate,
-                text: segment.edited_text.clone(),
-            })
-        })
-        .collect()
+    let mut cues = Vec::new();
+    for segment in retained {
+        validate_segment(segment, sample_rate)?;
+        push_split_cues(
+            &mut cues,
+            segment.start_sample,
+            segment.end_sample,
+            sample_rate,
+            &segment.edited_text,
+        );
+    }
+    Ok(cues)
 }
 
 fn validate_segment(
@@ -208,6 +207,113 @@ fn containing_range<'a>(
         preceding_duration += range.duration_samples();
     }
     unreachable!("validated segment must be contained in a merged export range")
+}
+
+fn push_split_cues(
+    cues: &mut Vec<ExportCue>,
+    start_sample: u64,
+    end_sample: u64,
+    sample_rate: u32,
+    text: &str,
+) {
+    for (start_sample, end_sample, text) in split_cue(start_sample, end_sample, text) {
+        cues.push(ExportCue {
+            index: cues.len() as u32 + 1,
+            start_sample,
+            end_sample,
+            sample_rate,
+            text,
+        });
+    }
+}
+
+fn split_cue(start_sample: u64, end_sample: u64, text: &str) -> Vec<(u64, u64, String)> {
+    let ranges = split_text_ranges(text);
+    if ranges.len() <= 1 || end_sample - start_sample < ranges.len() as u64 {
+        return vec![(start_sample, end_sample, text.trim().to_owned())];
+    }
+
+    let weights = ranges
+        .iter()
+        .map(|range| content_character_count(&text[range.clone()]))
+        .collect::<Vec<_>>();
+    let total_weight = weights.iter().sum::<usize>();
+    if total_weight == 0 {
+        return vec![(start_sample, end_sample, text.trim().to_owned())];
+    }
+
+    let duration = end_sample - start_sample;
+    let mut output = Vec::with_capacity(ranges.len());
+    let mut current_start = start_sample;
+    let mut accumulated_weight = 0usize;
+    for (index, range) in ranges.into_iter().enumerate() {
+        let current_end = if index + 1 == weights.len() {
+            end_sample
+        } else {
+            accumulated_weight += weights[index];
+            let proportional = start_sample
+                + ((duration as u128 * accumulated_weight as u128) / total_weight as u128) as u64;
+            let remaining_cues = weights.len() - index - 1;
+            proportional.clamp(current_start + 1, end_sample - remaining_cues as u64)
+        };
+        output.push((current_start, current_end, text[range].to_owned()));
+        current_start = current_end;
+    }
+    output
+}
+
+fn split_text_ranges(text: &str) -> Vec<Range<usize>> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let characters = text.char_indices().collect::<Vec<_>>();
+    for (position, (index, character)) in characters.iter().copied().enumerate() {
+        if is_export_split_punctuation(&characters, position, character) {
+            let end = index + character.len_utf8();
+            push_trimmed_range(text, start..end, &mut ranges);
+            start = end;
+        }
+    }
+    push_trimmed_range(text, start..text.len(), &mut ranges);
+    ranges
+}
+
+fn is_export_split_punctuation(
+    characters: &[(usize, char)],
+    position: usize,
+    character: char,
+) -> bool {
+    if is_numeric_separator(characters, position, character) {
+        return false;
+    }
+    matches!(character, '，' | ',' | '。' | '.' | '？' | '?' | '！' | '!')
+}
+
+fn is_numeric_separator(characters: &[(usize, char)], position: usize, character: char) -> bool {
+    matches!(character, '.' | ',')
+        && position > 0
+        && position + 1 < characters.len()
+        && characters[position - 1].1.is_ascii_digit()
+        && characters[position + 1].1.is_ascii_digit()
+}
+
+fn content_character_count(text: &str) -> usize {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .count()
+}
+
+fn push_trimmed_range(text: &str, range: Range<usize>, ranges: &mut Vec<Range<usize>>) {
+    let value = &text[range.clone()];
+    let leading = value.len() - value.trim_start().len();
+    let trailing = value.len() - value.trim_end().len();
+    let trimmed = range.start + leading..range.end - trailing;
+    if !trimmed.is_empty() {
+        ranges.push(trimmed);
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +371,74 @@ mod tests {
     }
 
     #[test]
+    fn splits_export_cues_at_punctuation_without_a_minimum_length() {
+        let timeline =
+            build_export_timeline(&[segment(1, 0, 900, "好，行。结束")]).expect("timeline");
+
+        assert_eq!(
+            timeline
+                .cues
+                .iter()
+                .map(|cue| (
+                    cue.index,
+                    cue.start_sample,
+                    cue.end_sample,
+                    cue.text.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 0, 225, "好，"),
+                (2, 225, 450, "行。"),
+                (3, 450, 900, "结束")
+            ]
+        );
+        assert_eq!(
+            timeline.ranges,
+            vec![SampleRange {
+                start_sample: 0,
+                end_sample: 900,
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_numeric_separators_when_splitting_export_cues() {
+        let timeline = build_export_timeline(&[segment(1, 0, 1_000, "版本 2.5，数量 1,000！结束")])
+            .expect("timeline");
+
+        assert_eq!(
+            timeline
+                .cues
+                .iter()
+                .map(|cue| cue.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["版本 2.5，", "数量 1,000！", "结束"]
+        );
+    }
+
+    #[test]
+    fn splits_original_subtitle_cues_with_original_timestamps() {
+        let cues = build_original_subtitle_cues(&[segment(1, 100, 1_000, "好，行。结束")])
+            .expect("original cues");
+
+        assert_eq!(
+            cues.iter()
+                .map(|cue| (
+                    cue.index,
+                    cue.start_sample,
+                    cue.end_sample,
+                    cue.text.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 100, 325, "好，"),
+                (2, 325, 550, "行。"),
+                (3, 550, 1_000, "结束")
+            ]
+        );
+    }
+
+    #[test]
     fn ignores_deleted_segments() {
         let mut deleted = segment(1, 0, 100, "删除");
         deleted.delete();
@@ -278,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_split_subtitles_in_one_range_when_all_are_retained() {
+    fn keeps_adjacent_retained_segments_in_one_export_range() {
         let segments = vec![
             segment(1, 100, 200, "第一段"),
             segment(2, 200, 300, "第二段"),
@@ -305,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_only_the_deleted_split_subtitle_range() {
+    fn removes_only_the_deleted_segment_range() {
         let first = segment(1, 100, 200, "第一段");
         let mut deleted = segment(2, 200, 300, "删除");
         deleted.delete();

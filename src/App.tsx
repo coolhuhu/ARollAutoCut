@@ -88,7 +88,12 @@ type PlaybackState = {
   segmentId: number | null;
   currentSeconds: number;
   isPlaying: boolean;
+  isPreparing: boolean;
 };
+
+const MEDIA_READY_TIMEOUT_MS = 1500;
+const HAVE_METADATA = 1;
+const HAVE_FUTURE_DATA = 3;
 
 const DEFAULT_VAD_FIELDS: VadSettingsFields = {
   minSilenceDuration: "0.5",
@@ -191,6 +196,73 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+function waitForMediaEvent(
+  audio: HTMLAudioElement,
+  eventName: keyof HTMLMediaElementEventMap,
+  predicate: () => boolean,
+): Promise<void> {
+  if (predicate()) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for ${eventName}`));
+    }, MEDIA_READY_TIMEOUT_MS);
+
+    function cleanup() {
+      window.clearTimeout(timeout);
+      audio.removeEventListener(eventName, handleEvent);
+      audio.removeEventListener("error", handleError);
+    }
+
+    function handleEvent() {
+      if (!predicate()) {
+        return;
+      }
+      cleanup();
+      resolve();
+    }
+
+    function handleError() {
+      cleanup();
+      reject(new Error("Audio playback failed"));
+    }
+
+    audio.addEventListener(eventName, handleEvent);
+    audio.addEventListener("error", handleError);
+  });
+}
+
+async function prepareAudioForPlayback(
+  audio: HTMLAudioElement,
+  targetSeconds: number,
+): Promise<void> {
+  await waitForMediaEvent(
+    audio,
+    "loadedmetadata",
+    () => audio.readyState >= HAVE_METADATA,
+  );
+
+  if (Math.abs(audio.currentTime - targetSeconds) > 0.02) {
+    audio.currentTime = targetSeconds;
+    await waitForMediaEvent(
+      audio,
+      "seeked",
+      () => !audio.seeking && Math.abs(audio.currentTime - targetSeconds) <= 0.05,
+    );
+  } else {
+    audio.currentTime = targetSeconds;
+  }
+
+  await waitForMediaEvent(
+    audio,
+    "canplay",
+    () => audio.readyState >= HAVE_FUTURE_DATA,
+  );
+}
+
 export default function App() {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [modelError, setModelError] = useState("");
@@ -222,10 +294,12 @@ export default function App() {
   const exportMenuRef = useRef<HTMLDivElement>(null);
   const previewAudioRef = useRef<HTMLAudioElement>(null);
   const playbackRangeRef = useRef<PlaybackRange | null>(null);
+  const playbackRequestIdRef = useRef(0);
   const [playback, setPlayback] = useState<PlaybackState>({
     segmentId: null,
     currentSeconds: 0,
     isPlaying: false,
+    isPreparing: false,
   });
   const [playbackError, setPlaybackError] = useState("");
   closeProtectionRef.current = shouldProtectAppClose({
@@ -317,6 +391,21 @@ export default function App() {
       unlisten?.();
     };
   }, []);
+
+  useEffect(() => {
+    if (phase !== "editor" || !result) {
+      return;
+    }
+    const audio = previewAudioRef.current;
+    if (!audio) {
+      return;
+    }
+    try {
+      audio.load();
+    } catch {
+      // Some test environments do not implement media loading.
+    }
+  }, [phase, result?.previewAudioPath]);
 
   async function refreshModelStatus() {
     try {
@@ -520,12 +609,18 @@ export default function App() {
   }
 
   function stopPreviewPlayback() {
+    playbackRequestIdRef.current += 1;
     const audio = previewAudioRef.current;
     if (audio) {
       audio.pause();
     }
     playbackRangeRef.current = null;
-    setPlayback({ segmentId: null, currentSeconds: 0, isPlaying: false });
+    setPlayback({
+      segmentId: null,
+      currentSeconds: 0,
+      isPlaying: false,
+      isPreparing: false,
+    });
   }
 
   async function toggleSegmentPlayback(segment: TranscriptSegment) {
@@ -535,63 +630,131 @@ export default function App() {
       return;
     }
     const durationSeconds = segmentDurationSeconds(segment);
-    const range = {
+    const range: PlaybackRange = {
       segmentId: segment.id,
       startSeconds: segmentStartSeconds(segment),
       endSeconds: segmentEndSeconds(segment),
       durationSeconds,
     };
 
-    if (playback.segmentId === segment.id && playback.isPlaying) {
+    if (
+      playback.segmentId === segment.id &&
+      (playback.isPlaying || playback.isPreparing)
+    ) {
+      playbackRequestIdRef.current += 1;
       audio.pause();
-      setPlayback((current) => ({ ...current, isPlaying: false }));
+      setPlayback((current) => ({
+        ...current,
+        isPlaying: false,
+        isPreparing: false,
+      }));
       return;
     }
 
+    const requestId = playbackRequestIdRef.current + 1;
+    playbackRequestIdRef.current = requestId;
+    audio.pause();
     playbackRangeRef.current = range;
     const resumeSeconds =
       playback.segmentId === segment.id && playback.currentSeconds < durationSeconds
         ? playback.currentSeconds
         : 0;
-    audio.currentTime = range.startSeconds + resumeSeconds;
     setPlayback({
       segmentId: segment.id,
       currentSeconds: resumeSeconds,
-      isPlaying: true,
+      isPlaying: false,
+      isPreparing: true,
     });
     setPlaybackError("");
 
     try {
+      await prepareAudioForPlayback(audio, range.startSeconds + resumeSeconds);
+      if (playbackRequestIdRef.current !== requestId) {
+        return;
+      }
       await audio.play();
+      if (playbackRequestIdRef.current !== requestId) {
+        audio.pause();
+        return;
+      }
+      setPlayback({
+        segmentId: segment.id,
+        currentSeconds: resumeSeconds,
+        isPlaying: true,
+        isPreparing: false,
+      });
     } catch {
+      if (playbackRequestIdRef.current !== requestId) {
+        return;
+      }
       setPlayback({
         segmentId: segment.id,
         currentSeconds: resumeSeconds,
         isPlaying: false,
+        isPreparing: false,
       });
       setPlaybackError("无法播放该媒体片段，请确认原文件仍存在且格式可播放。");
     }
   }
 
-  function seekSegmentPlayback(segment: TranscriptSegment, value: string) {
+  async function seekSegmentPlayback(segment: TranscriptSegment, value: string) {
     const audio = previewAudioRef.current;
     const durationSeconds = segmentDurationSeconds(segment);
     const currentSeconds = clamp(Number(value), 0, durationSeconds);
-    const range = {
+    const range: PlaybackRange = {
       segmentId: segment.id,
       startSeconds: segmentStartSeconds(segment),
       endSeconds: segmentEndSeconds(segment),
       durationSeconds,
     };
     playbackRangeRef.current = range;
-    if (audio) {
-      audio.currentTime = range.startSeconds + currentSeconds;
+    const shouldResume = playback.segmentId === segment.id && playback.isPlaying;
+    const requestId = shouldResume ? playbackRequestIdRef.current + 1 : playbackRequestIdRef.current;
+    if (shouldResume) {
+      playbackRequestIdRef.current = requestId;
+      audio?.pause();
     }
     setPlayback((current) => ({
       segmentId: segment.id,
       currentSeconds,
-      isPlaying: current.segmentId === segment.id && current.isPlaying,
+      isPlaying: false,
+      isPreparing: current.segmentId === segment.id && current.isPlaying,
     }));
+    if (!audio) {
+      return;
+    }
+    if (!shouldResume) {
+      audio.currentTime = range.startSeconds + currentSeconds;
+      return;
+    }
+    try {
+      await prepareAudioForPlayback(audio, range.startSeconds + currentSeconds);
+      if (playbackRequestIdRef.current !== requestId) {
+        return;
+      }
+      await audio.play();
+      if (playbackRequestIdRef.current !== requestId) {
+        audio.pause();
+        return;
+      }
+      setPlayback({
+        segmentId: segment.id,
+        currentSeconds,
+        isPlaying: true,
+        isPreparing: false,
+      });
+    } catch {
+      if (playbackRequestIdRef.current !== requestId) {
+        return;
+      }
+      setPlayback({
+        segmentId: segment.id,
+        currentSeconds,
+        isPlaying: false,
+        isPreparing: false,
+      });
+      setPlaybackError("无法从该位置播放音频，请稍后重试。");
+    }
   }
 
   function updatePreviewPlaybackProgress() {
@@ -612,6 +775,7 @@ export default function App() {
         segmentId: range.segmentId,
         currentSeconds: range.durationSeconds,
         isPlaying: false,
+        isPreparing: false,
       });
       return;
     }
@@ -619,11 +783,16 @@ export default function App() {
       segmentId: range.segmentId,
       currentSeconds,
       isPlaying: !audio.paused,
+      isPreparing: false,
     });
   }
 
   function finishPreviewPlayback() {
-    setPlayback((current) => ({ ...current, isPlaying: false }));
+    setPlayback((current) => ({
+      ...current,
+      isPlaying: false,
+      isPreparing: false,
+    }));
   }
 
   async function startExport(mode: ExportMode) {
@@ -839,6 +1008,13 @@ export default function App() {
                 : 0;
               const isSegmentPlaying =
                 isCurrentPlayback && playback.isPlaying;
+              const isSegmentPreparing =
+                isCurrentPlayback && playback.isPreparing;
+              const playbackButtonLabel = isSegmentPreparing
+                ? "准备中"
+                : isSegmentPlaying
+                  ? "暂停"
+                  : "播放";
               const isEditing = editingId === segment.id;
               return (
                 <article
@@ -866,10 +1042,10 @@ export default function App() {
                         <button
                           className="segment-play-button"
                           type="button"
-                          aria-label={`${isSegmentPlaying ? "暂停" : "播放"}第 ${segment.id} 条字幕`}
+                          aria-label={`${playbackButtonLabel}第 ${segment.id} 条字幕`}
                           onClick={() => void toggleSegmentPlayback(segment)}
                         >
-                          {isSegmentPlaying ? "暂停" : "播放"}
+                          {playbackButtonLabel}
                         </button>
                         <span className="playback-time">
                           {formatPlaybackClock(playbackSeconds)}
@@ -883,7 +1059,7 @@ export default function App() {
                           value={playbackSeconds}
                           aria-label={`第 ${segment.id} 条字幕播放进度`}
                           onChange={(event) =>
-                            seekSegmentPlayback(
+                            void seekSegmentPlayback(
                               segment,
                               event.currentTarget.value,
                             )
@@ -977,7 +1153,10 @@ export default function App() {
         </section>
 
         {exportProgress && (
-          <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal-backdrop modal-backdrop-centered"
+            role="presentation"
+          >
             <section
               className="export-dialog"
               role="dialog"
@@ -1010,7 +1189,10 @@ export default function App() {
         )}
 
         {exportResult && (
-          <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal-backdrop modal-backdrop-centered"
+            role="presentation"
+          >
             <section
               className="export-complete-dialog"
               role="dialog"

@@ -76,6 +76,9 @@ describe("App", () => {
       minSpeechDuration: 0.25,
       maxSpeechDuration: 20,
     });
+    vi.spyOn(window.HTMLMediaElement.prototype, "load").mockImplementation(
+      () => {},
+    );
   });
 
   it("renders the initial upload experience", async () => {
@@ -297,19 +300,66 @@ describe("App", () => {
       .spyOn(window.HTMLMediaElement.prototype, "pause")
       .mockImplementation(() => {});
 
-    fireEvent.click(screen.getByRole("button", { name: "播放第 1 条字幕" }));
-    expect(playAudio).toHaveBeenCalledOnce();
-    expect(
-      screen.getByRole("button", { name: "暂停第 1 条字幕" }),
-    ).toBeInTheDocument();
     const previewAudio = screen.getByTestId(
       "preview-audio",
     ) as HTMLAudioElement;
+    Object.defineProperty(previewAudio, "readyState", {
+      configurable: true,
+      value: 0,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "播放第 1 条字幕" }));
+    expect(playAudio).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "准备中第 1 条字幕" }),
+    ).toBeInTheDocument();
+
+    Object.defineProperty(previewAudio, "readyState", {
+      configurable: true,
+      value: 1,
+    });
+    fireEvent(previewAudio, new Event("loadedmetadata"));
+    Object.defineProperty(previewAudio, "readyState", {
+      configurable: true,
+      value: 3,
+    });
+    fireEvent(previewAudio, new Event("canplay"));
+
+    await waitFor(() => expect(playAudio).toHaveBeenCalledOnce());
+    expect(
+      screen.getByRole("button", { name: "暂停第 1 条字幕" }),
+    ).toBeInTheDocument();
     const firstSegmentProgress = screen.getByLabelText("第 1 条字幕播放进度");
-    fireEvent.change(firstSegmentProgress, { target: { value: "0.5" } });
-    expect(previewAudio.currentTime).toBeCloseTo(0.5);
     fireEvent.click(screen.getByRole("button", { name: "暂停第 1 条字幕" }));
     expect(pauseAudio).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "播放第 1 条字幕" }),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.change(firstSegmentProgress, { target: { value: "0.5" } });
+    expect(previewAudio.currentTime).toBeCloseTo(0.5);
+
+    Object.defineProperty(previewAudio, "seeking", {
+      configurable: true,
+      value: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "播放第 2 条字幕" }));
+    expect(playAudio).toHaveBeenCalledOnce();
+    await waitFor(() => expect(previewAudio.currentTime).toBeCloseTo(1.5));
+    expect(
+      screen.getByRole("button", { name: "准备中第 2 条字幕" }),
+    ).toBeInTheDocument();
+    Object.defineProperty(previewAudio, "seeking", {
+      configurable: true,
+      value: false,
+    });
+    fireEvent(previewAudio, new Event("seeked"));
+    await waitFor(() => expect(playAudio).toHaveBeenCalledTimes(2));
+    expect(
+      screen.getByRole("button", { name: "暂停第 2 条字幕" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "暂停第 2 条字幕" }));
     playAudio.mockRestore();
     pauseAudio.mockRestore();
 
